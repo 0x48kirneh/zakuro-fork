@@ -164,6 +164,9 @@ impl Drop for Server {
 
 /// a member's time in the room, from its hello to its leaving.
 fn seat(mut stream: TcpStream, address: String, seats: &Mutex<Seats>, stop: &AtomicBool) {
+    // on Windows a stream takes the listener's not blocking, and the member
+    // would be gone at the first read with nothing to read yet
+    let _ = stream.set_nonblocking(false);
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(PATIENCE));
     let Ok(ToRoom::Hello { version, nickname, password }) = read(&mut stream) else { return };
