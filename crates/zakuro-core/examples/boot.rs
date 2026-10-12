@@ -16,6 +16,8 @@ fn main() {
     let frames: u64 = args.next().and_then(|a| a.parse().ok()).unwrap_or(60);
 
     let config = Config {
+        // ZAKURO_NEW3DS=1 runs the title on a New 3DS.
+        new3ds: std::env::var("ZAKURO_NEW3DS").is_ok_and(|v| v == "1"),
         language: std::env::var("ZAKURO_LANGUAGE")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -176,6 +178,8 @@ fn main() {
                 touch,
                 circle_x: axis(PadState::CIRCLE_RIGHT, PadState::CIRCLE_LEFT),
                 circle_y: axis(PadState::CIRCLE_UP, PadState::CIRCLE_DOWN),
+                c_stick_x: axis(PadState::C_STICK_RIGHT, PadState::C_STICK_LEFT),
+                c_stick_y: axis(PadState::C_STICK_UP, PadState::C_STICK_DOWN),
                 ..InputState::default()
             });
         } else if mashing {
@@ -508,8 +512,8 @@ fn temp(name: &str) -> String {
 }
 
 /// parses frame:BUTTON[+BUTTON...] entries separated by commas, where @XxY
-/// touches the bottom screen at X, Y and CUP, CDOWN, CLEFT and CRIGHT push
-/// the circle pad.
+/// touches the bottom screen at X, Y, CUP, CDOWN, CLEFT and CRIGHT push
+/// the circle pad and CSUP, CSDOWN, CSLEFT and CSRIGHT the C-stick.
 fn parse_input_script(spec: &str) -> Vec<(u64, PadState, Option<(u16, u16)>)> {
     spec.split(',')
         .filter_map(|entry| {
@@ -537,6 +541,12 @@ fn parse_input_script(spec: &str) -> Vec<(u64, PadState, Option<(u16, u16)>)> {
                     "CDOWN" => PadState::CIRCLE_DOWN,
                     "CLEFT" => PadState::CIRCLE_LEFT,
                     "CRIGHT" => PadState::CIRCLE_RIGHT,
+                    "CSUP" => PadState::C_STICK_UP,
+                    "CSDOWN" => PadState::C_STICK_DOWN,
+                    "CSLEFT" => PadState::C_STICK_LEFT,
+                    "CSRIGHT" => PadState::C_STICK_RIGHT,
+                    "ZL" => PadState::ZL,
+                    "ZR" => PadState::ZR,
                     other => {
                         eprintln!("unknown button '{other}' in ZAKURO_INPUT");
                         return None;

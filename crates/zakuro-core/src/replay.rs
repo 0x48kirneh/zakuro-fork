@@ -1,7 +1,7 @@
 //! a run's inputs written down frame by frame, with the clock it started
 //! at, so the run can be played back exactly. a line per change of input,
-//! the frame it starts at, the buttons, the circle pad, the touch and the
-//! tilt, which recordings from before tilt leave out.
+//! the frame it starts at, the buttons, the circle pad, the touch, the tilt
+//! and the C-stick, which recordings from before them leave out.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -30,11 +30,13 @@ impl Recorder {
             let (x, y) = input.touch.map_or((-1, -1), |(x, y)| (x as i32, y as i32));
             let [tilt_x, tilt_y] = input.tilt;
             let line = format!(
-                "{} {:x} {:?} {:?} {x} {y} {tilt_x:?} {tilt_y:?}",
+                "{} {:x} {:?} {:?} {x} {y} {tilt_x:?} {tilt_y:?} {:?} {:?}",
                 self.frame,
                 input.buttons.bits(),
                 input.circle_x,
-                input.circle_y
+                input.circle_y,
+                input.c_stick_x,
+                input.c_stick_y
             );
             // written through at once, the run may end in a crash
             if writeln!(self.out, "{line}").and_then(|()| self.out.flush()).is_err() {
@@ -63,13 +65,15 @@ impl Replay {
         for line in lines {
             let line = line?;
             let fields: Vec<&str> = line.split_whitespace().collect();
-            let (head, tilt) = fields.split_at(fields.len().min(6));
+            let (head, rest) = fields.split_at(fields.len().min(6));
             let [frame, buttons, x, y, tx, ty] = head[..] else { return Err(bad(&line)) };
             let parse = || -> Option<(u64, InputState)> {
                 let (tx, ty): (i32, i32) = (tx.parse().ok()?, ty.parse().ok()?);
-                let tilt = match tilt {
-                    [] => [0.0; 2],
-                    [x, y] => [x.parse().ok()?, y.parse().ok()?],
+                let pair = |x: &str, y: &str| -> Option<[f32; 2]> { Some([x.parse().ok()?, y.parse().ok()?]) };
+                let (tilt, c_stick) = match rest {
+                    [] => ([0.0; 2], [0.0; 2]),
+                    [x, y] => (pair(x, y)?, [0.0; 2]),
+                    [x, y, cx, cy] => (pair(x, y)?, pair(cx, cy)?),
                     _ => return None,
                 };
                 Some((
@@ -80,6 +84,8 @@ impl Replay {
                         circle_y: y.parse().ok()?,
                         touch: (tx >= 0).then_some((tx as u16, ty as u16)),
                         tilt,
+                        c_stick_x: c_stick[0],
+                        c_stick_y: c_stick[1],
                     },
                 ))
             };
@@ -114,7 +120,15 @@ mod tests {
     #[test]
     fn a_recording_plays_back() {
         let path = std::env::temp_dir().join(format!("zakuro-replay-{}.txt", std::process::id()));
-        let pressed = InputState { buttons: PadState::A, circle_x: 0.5, circle_y: -1.0, touch: Some((10, 20)), tilt: [0.25, -0.5] };
+        let pressed = InputState {
+            buttons: PadState::A | PadState::ZL,
+            circle_x: 0.5,
+            circle_y: -1.0,
+            touch: Some((10, 20)),
+            tilt: [0.25, -0.5],
+            c_stick_x: -0.75,
+            c_stick_y: 1.0,
+        };
         let mut recorder = Recorder::create(&path, 1234).unwrap();
         for frame in 0..10 {
             recorder.record(if (3..6).contains(&frame) { pressed } else { InputState::default() });

@@ -1027,11 +1027,11 @@ impl App {
         let typing = self.game.as_ref().is_some_and(|game| game.system.keyboard_request().is_some());
         let playing =
             self.game.is_some() && !self.paused && !self.menus.menu_open && !self.menus.settings_open && !typing;
-        // Tab or a controller's right trigger, unless it is bound to a
-        // button of the console's
-        let trigger = gilrs::Button::RightTrigger2;
-        let trigger_free = self.settings.pad.map().iter().all(|&(_, bound)| bound != trigger);
-        let fast = playing && (self.fast_forward_key || (trigger_free && self.gamepads.holding(trigger)));
+        // Tab or a controller's right trigger, or the right stick's click
+        // while ZR has the trigger, whichever no button of the console's is on
+        let free = |button: gilrs::Button| self.settings.pad.map().iter().all(|&(_, bound)| bound != button);
+        let trigger = [gilrs::Button::RightTrigger2, gilrs::Button::RightThumb].into_iter().find(|&button| free(button));
+        let fast = playing && (self.fast_forward_key || trigger.is_some_and(|trigger| self.gamepads.holding(trigger)));
         if fast {
             // the output waits out fast forward rather than run dry
             if let Some(audio) = &self.audio {

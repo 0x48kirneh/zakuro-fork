@@ -170,7 +170,7 @@ impl Language {
     }
 }
 
-/// the keys the console's buttons and circle pad are on.
+/// the keys the console's buttons, circle pad and C-stick are on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Keys {
@@ -190,6 +190,12 @@ pub struct Keys {
     pub circle_down: KeyCode,
     pub circle_left: KeyCode,
     pub circle_right: KeyCode,
+    pub zl: KeyCode,
+    pub zr: KeyCode,
+    pub c_up: KeyCode,
+    pub c_down: KeyCode,
+    pub c_left: KeyCode,
+    pub c_right: KeyCode,
 }
 
 impl Default for Keys {
@@ -211,6 +217,12 @@ impl Default for Keys {
             circle_down: KeyCode::KeyK,
             circle_left: KeyCode::KeyJ,
             circle_right: KeyCode::KeyL,
+            zl: KeyCode::Digit1,
+            zr: KeyCode::Digit2,
+            c_up: KeyCode::KeyT,
+            c_down: KeyCode::KeyG,
+            c_left: KeyCode::KeyF,
+            c_right: KeyCode::KeyH,
         }
     }
 }
@@ -222,7 +234,7 @@ impl Keys {
     }
 
     /// every binding with the name it goes by, to show and change them.
-    pub fn all_mut(&mut self) -> [(&'static str, &mut KeyCode); 16] {
+    pub fn all_mut(&mut self) -> [(&'static str, &mut KeyCode); 22] {
         [
             ("A", &mut self.a),
             ("B", &mut self.b),
@@ -240,13 +252,19 @@ impl Keys {
             ("Circle pad down", &mut self.circle_down),
             ("Circle pad left", &mut self.circle_left),
             ("Circle pad right", &mut self.circle_right),
+            ("ZL", &mut self.zl),
+            ("ZR", &mut self.zr),
+            ("C-stick up", &mut self.c_up),
+            ("C-stick down", &mut self.c_down),
+            ("C-stick left", &mut self.c_left),
+            ("C-stick right", &mut self.c_right),
         ]
     }
 }
 
 /// the controller buttons the console's buttons are on, the face buttons
 /// where the 3DS has them rather than by their letters. the circle pad is
-/// the left stick.
+/// the left stick and the C-stick the right one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PadButtons {
@@ -262,6 +280,8 @@ pub struct PadButtons {
     pub down: Button,
     pub left: Button,
     pub right: Button,
+    pub zl: Button,
+    pub zr: Button,
 }
 
 impl Default for PadButtons {
@@ -279,13 +299,15 @@ impl Default for PadButtons {
             down: Button::DPadDown,
             left: Button::DPadLeft,
             right: Button::DPadRight,
+            zl: Button::LeftTrigger2,
+            zr: Button::RightTrigger2,
         }
     }
 }
 
 impl PadButtons {
     /// every binding with the name it goes by, to show and change them.
-    pub fn all_mut(&mut self) -> [(&'static str, &mut Button); 12] {
+    pub fn all_mut(&mut self) -> [(&'static str, &mut Button); 14] {
         [
             ("A", &mut self.a),
             ("B", &mut self.b),
@@ -299,11 +321,13 @@ impl PadButtons {
             ("D-pad down", &mut self.down),
             ("D-pad left", &mut self.left),
             ("D-pad right", &mut self.right),
+            ("ZL", &mut self.zl),
+            ("ZR", &mut self.zr),
         ]
     }
 
     /// each of the console's buttons and the controller button it is on.
-    pub fn map(&self) -> [(PadState, Button); 12] {
+    pub fn map(&self) -> [(PadState, Button); 14] {
         [
             (PadState::A, self.a),
             (PadState::B, self.b),
@@ -317,6 +341,8 @@ impl PadButtons {
             (PadState::DOWN, self.down),
             (PadState::LEFT, self.left),
             (PadState::RIGHT, self.right),
+            (PadState::ZL, self.zl),
+            (PadState::ZR, self.zr),
         ]
     }
 }

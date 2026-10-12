@@ -71,11 +71,17 @@ impl Gamepads {
                     state.buttons.set(button, true);
                 }
             }
-            // the left stick is the circle pad, up positive as the console has it
+            // the left stick is the circle pad and the right one the
+            // C-stick, up positive as the console has it
             let (x, y) = (pad.value(Axis::LeftStickX), pad.value(Axis::LeftStickY));
             if x.hypot(y) > DEADZONE {
                 state.circle_x = x.clamp(-1.0, 1.0);
                 state.circle_y = y.clamp(-1.0, 1.0);
+            }
+            let (x, y) = (pad.value(Axis::RightStickX), pad.value(Axis::RightStickY));
+            if x.hypot(y) > DEADZONE {
+                state.c_stick_x = x.clamp(-1.0, 1.0);
+                state.c_stick_y = y.clamp(-1.0, 1.0);
             }
         }
         state
