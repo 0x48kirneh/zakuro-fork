@@ -11,7 +11,7 @@ use zakuro_core::services::keyboard::Request;
 use crate::library::{Library, ICON_SIZE};
 use crate::recompile::{Job, Stage};
 use crate::gamepad::button_name;
-use crate::settings::{Filter, Keys, Language, PadButtons, Renderer, Screens, Settings};
+use crate::settings::{CameraSource, Filter, Keys, Language, PadButtons, Renderer, Screens, Settings};
 
 /// what the user asked for.
 #[derive(Debug, Clone, PartialEq)]
@@ -27,6 +27,8 @@ pub enum Action {
     CancelRecompile(u64),
     ChooseFolder,
     ChooseBackground,
+    /// pick the picture the cameras see.
+    ChooseCameraPicture,
     Rescan,
     Resume,
     Reset,
@@ -348,6 +350,13 @@ impl Menus {
                 if wide(ui, "Cheats") {
                     self.cheats_open = true;
                 }
+                if ui
+                    .add_sized([200.0, 28.0], egui::Button::new("Show the camera a picture"))
+                    .on_hover_text("Pick a picture for the console's cameras to see, a QR code's say, in place of the computer's camera.")
+                    .clicked()
+                {
+                    actions.push(Action::ChooseCameraPicture);
+                }
                 if wide(ui, "Copy info for a report") {
                     actions.push(Action::CopyReport);
                 }
@@ -498,6 +507,25 @@ impl Menus {
                 })
                 .response
                 .on_hover_text("The console's system language, which titles pick their localised text and files by. It changes with the next game started, or Reset.");
+                egui::ComboBox::from_label("Cameras").selected_text(settings.camera.name()).show_ui(ui, |ui| {
+                    for source in CameraSource::ALL {
+                        ui.selectable_value(&mut settings.camera, source, source.name());
+                    }
+                })
+                .response
+                .on_hover_text("What the console's cameras see. The computer's camera turns on only while a game takes pictures.");
+                if settings.camera == CameraSource::Picture {
+                    ui.horizontal(|ui| {
+                        ui.label("Picture");
+                        match &settings.camera_picture {
+                            Some(path) => ui.label(path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()),
+                            None => ui.label(RichText::new("none").weak()),
+                        };
+                        if ui.button("Choose…").clicked() {
+                            actions.push(Action::ChooseCameraPicture);
+                        }
+                    });
+                }
                 ui.radio_value(&mut settings.recompiled, true, "Recompiled code when there is some");
                 ui.radio_value(&mut settings.recompiled, false, "Interpreter only");
                 ui.label(RichText::new("It changes with the next game started, or Reset.").weak());

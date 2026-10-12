@@ -3,6 +3,7 @@
 //! at a time.
 
 mod audio;
+mod camera;
 mod cli;
 mod gamepad;
 mod gui;
@@ -34,7 +35,7 @@ use library::Library;
 use menus::{Action, Menus};
 use present::Backend;
 use recompile::{Job, Stage, Toolchain};
-use settings::{Renderer, Screens, Settings};
+use settings::{CameraSource, Renderer, Screens, Settings};
 
 pub use zakuro_core::recompiled::Linked;
 
@@ -88,6 +89,7 @@ pub fn run(linked: Option<Linked>) {
         fast_forwarding: false,
         next_shown: Instant::now(),
         stop: false,
+        camera: None,
         maximized_before_full_screen: false,
         resize_after_full_screen: false,
     };
@@ -353,6 +355,9 @@ struct App {
     /// frame rate.
     next_shown: Instant,
     stop: bool,
+    /// what the running game's cameras were given to see, to give them
+    /// another only when the settings change it.
+    camera: Option<(CameraSource, Option<PathBuf>)>,
     /// the window was maximized when it went full screen, which leaving
     /// full screen brings back.
     maximized_before_full_screen: bool,
@@ -608,6 +613,9 @@ impl App {
             ));
         }
         self.game = Some(game);
+        // the new game's cameras see what the settings say
+        self.camera = None;
+        self.apply_camera();
         self.menus.menu_open = false;
         self.keyboard.release();
         self.paused = false;
@@ -772,10 +780,36 @@ impl App {
                 log::info!("frame interpolation {}", if on { "on" } else { "off" });
             }
         }
+        self.apply_camera();
         self.keyboard.set_keys(self.settings.keys.clone());
         self.gamepads.set_buttons(self.settings.pad.clone());
         self.apply_volume();
         self.apply_layout();
+    }
+
+    /// gives the running game's cameras what the settings say they see,
+    /// when it is not what they have.
+    fn apply_camera(&mut self) {
+        let wanted = (self.settings.camera, self.settings.camera_picture.clone());
+        let Some(game) = &mut self.game else { return };
+        if self.camera.as_ref() == Some(&wanted) {
+            return;
+        }
+        game.system.camera = match &wanted {
+            (CameraSource::Webcam, _) => Some(Box::new(camera::Webcam::default())),
+            (CameraSource::Picture, Some(path)) => match camera::picture(path) {
+                Ok(picture) => {
+                    log::info!("the cameras see {}", path.display());
+                    Some(Box::new(picture))
+                }
+                Err(error) => {
+                    self.menus.message = Some(error);
+                    None
+                }
+            },
+            _ => None,
+        };
+        self.camera = Some(wanted);
     }
 
     /// puts the screens' arrangement and the window scale to use, sizing
@@ -915,6 +949,17 @@ impl App {
                     self.settings.games = Some(folder.clone());
                     self.settings.save();
                     self.library.scan(&folder);
+                }
+            }
+            Action::ChooseCameraPicture => {
+                let picked = rfd::FileDialog::new()
+                    .set_title("A picture for the cameras")
+                    .add_filter("Pictures", &["png", "jpg", "jpeg", "webp", "bmp"])
+                    .pick_file();
+                if let Some(file) = picked {
+                    self.settings.camera = CameraSource::Picture;
+                    self.settings.camera_picture = Some(file);
+                    self.apply_settings();
                 }
             }
             Action::ChooseBackground => {

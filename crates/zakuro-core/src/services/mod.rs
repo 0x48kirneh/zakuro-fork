@@ -2,6 +2,7 @@
 
 pub mod apt;
 pub mod boss;
+pub mod cam;
 pub mod cecd;
 pub mod err;
 pub mod cfg;
@@ -73,6 +74,7 @@ pub struct ServiceState {
     pub nfc: nfc::NfcState,
     pub cecd: cecd::CecdState,
     pub boss: boss::BossState,
+    pub cam: cam::CamState,
     /// commands we logged as unimplemented, so the log stays readable and the
     /// diagnostics overlay can show what a title is actually asking for.
     pub unimplemented: BTreeMap<(String, u16), u32>,
@@ -111,6 +113,7 @@ pub fn handle_request(system: &mut System, target: Target) {
         "nfc:u" | "nfc:m" => nfc::handle(system, &buffer, header),
         "cecd:u" | "cecd:s" => cecd::handle(system, &buffer, header),
         "boss:U" | "boss:P" => boss::handle(system, &buffer, header),
+        "cam:u" | "cam:s" => cam::handle(system, &buffer, header),
         _ => misc::handle(system, &buffer, header, &name),
     };
 

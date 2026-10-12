@@ -170,6 +170,30 @@ impl Language {
     }
 }
 
+/// what the console's cameras see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CameraSource {
+    /// the computer's camera, on only while a game takes pictures.
+    #[default]
+    Webcam,
+    /// a picture from a file, a QR code's say.
+    Picture,
+    /// nothing, black.
+    Nothing,
+}
+
+impl CameraSource {
+    pub const ALL: [CameraSource; 3] = [CameraSource::Webcam, CameraSource::Picture, CameraSource::Nothing];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            CameraSource::Webcam => "The computer's camera",
+            CameraSource::Picture => "A picture",
+            CameraSource::Nothing => "Nothing",
+        }
+    }
+}
+
 /// the keys the console's buttons, circle pad and C-stick are on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -390,6 +414,10 @@ pub struct Settings {
     pub pad: PadButtons,
     /// the enhancements turned on, by name, for each game by its title id.
     pub enhancements: std::collections::BTreeMap<String, Vec<String>>,
+    /// what the console's cameras see, and the picture when it is one.
+    #[serde(deserialize_with = "or_default")]
+    pub camera: CameraSource,
+    pub camera_picture: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -415,6 +443,8 @@ impl Default for Settings {
             keys: Keys::default(),
             pad: PadButtons::default(),
             enhancements: std::collections::BTreeMap::new(),
+            camera: CameraSource::Webcam,
+            camera_picture: None,
         }
     }
 }

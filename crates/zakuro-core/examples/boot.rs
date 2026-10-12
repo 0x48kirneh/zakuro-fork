@@ -76,6 +76,15 @@ fn main() {
         system.enable_profiler();
     }
 
+    // ZAKURO_CAMERA=picture.ppm is what the cameras see, a binary PPM,
+    // whole, the way a QR code is shown to them.
+    if let Some(path) = std::env::var_os("ZAKURO_CAMERA") {
+        match std::fs::read(&path).ok().and_then(|bytes| read_ppm(&bytes)) {
+            Some(picture) => system.camera = Some(Box::new(zakuro_core::camera::Still(std::sync::Arc::new(picture)))),
+            None => eprintln!("could not read {} as a binary PPM", path.to_string_lossy()),
+        }
+    }
+
     println!("--- booting for {frames} frames ---");
     let start = std::time::Instant::now();
     // how long each frame took, which shows the stutter an average hides
@@ -504,6 +513,30 @@ fn save_picture((pixels, width, height): &zakuro_core::Screen, path: &str) {
         ppm.extend_from_slice(&chunk[..3]);
     }
     let _ = std::fs::write(path, ppm);
+}
+
+/// a binary PPM's picture, P6 with eight bit channels.
+fn read_ppm(bytes: &[u8]) -> Option<zakuro_core::camera::Picture> {
+    // the magic, the width, the height and the largest value, apart by
+    // white space, then one more and the pixels
+    let mut fields = Vec::new();
+    let mut at = 0;
+    while fields.len() < 4 {
+        while bytes.get(at)?.is_ascii_whitespace() {
+            at += 1;
+        }
+        let start = at;
+        while !bytes.get(at)?.is_ascii_whitespace() {
+            at += 1;
+        }
+        fields.push(std::str::from_utf8(&bytes[start..at]).ok()?);
+    }
+    let (width, height): (u32, u32) = (fields[1].parse().ok()?, fields[2].parse().ok()?);
+    if fields[0] != "P6" || fields[3] != "255" {
+        return None;
+    }
+    let rgb = bytes.get(at + 1..at + 1 + (width * height * 3) as usize)?.to_vec();
+    Some(zakuro_core::camera::Picture { width, height, rgb, fit: zakuro_core::camera::Fit::Whole })
 }
 
 /// a file in the system's temporary directory, /tmp on Linux.

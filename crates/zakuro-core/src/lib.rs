@@ -1,6 +1,7 @@
 //! the emulated console, CPU, memory, HLE kernel, HLE services and GPU, and
 //! the loop that drives them.
 
+pub mod camera;
 pub mod cheats;
 pub mod enhancements;
 pub mod cro;
@@ -157,6 +158,8 @@ pub struct System {
     pacing: Pacing,
     /// the dynamic module loader's state.
     pub cro: cro::CroManager,
+    /// what the cameras see, from the frontend.
+    pub camera: Option<Box<dyn camera::Camera>>,
     /// errors the title reported through err:f, newest last.
     pub fatal_errors: Vec<String>,
     /// undefined instructions we have seen, so the log stays readable.
@@ -245,6 +248,7 @@ impl System {
             showing: [None, None],
             pacing: Pacing::default(),
             cro: cro::CroManager::default(),
+            camera: None,
             fatal_errors: Vec::new(),
             undefined_seen: BTreeMap::new(),
             prefetch_aborts: BTreeMap::new(),
@@ -719,6 +723,7 @@ impl System {
         // fine enough for
         services::ir_rst::tick(self);
         services::ir::tick(self);
+        services::cam::tick(self);
     }
 
     /// the stereo samples the console played since the last call, at
