@@ -596,15 +596,13 @@ impl Menus {
                                             ui.label(RichText::new(&offer.title).strong());
                                             ui.label(RichText::new(format!("from {}, {} of {} joined", offer.host, offer.guests, offer.most)).weak());
                                         });
-                                        let join = ui.add_enabled(offer.blocked.is_none(), egui::Button::new("Join"));
-                                        let join = match &offer.blocked {
-                                            Some(why) => join.on_disabled_hover_text(why),
-                                            None => join,
-                                        };
-                                        if join.clicked() {
+                                        if ui.add_enabled(offer.blocked.is_none(), egui::Button::new("Join")).clicked() {
                                             actions.push(Action::DlpJoin(index));
                                         }
                                     });
+                                    if let Some(why) = &offer.blocked {
+                                        ui.label(RichText::new(why).weak());
+                                    }
                                 }
                             }
                         }
