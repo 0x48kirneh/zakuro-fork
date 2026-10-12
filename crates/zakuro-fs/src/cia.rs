@@ -25,6 +25,8 @@ pub enum TitleKind {
     Update,
     /// downloadable content, data a game reads besides its own.
     Dlc,
+    /// a game's Download Play child, the program it sends others.
+    DlpChild,
 }
 
 /// a title version as the console shows it, major.minor.micro.
@@ -37,6 +39,7 @@ impl TitleKind {
         match title_id >> 32 {
             0x0004_000E => TitleKind::Update,
             0x0004_008C => TitleKind::Dlc,
+            0x0004_0001 => TitleKind::DlpChild,
             _ => TitleKind::Game,
         }
     }
@@ -125,7 +128,7 @@ impl Cia {
         match cia.kind() {
             TitleKind::Update => return Err(FsError::NotAGame("an update")),
             TitleKind::Dlc => return Err(FsError::NotAGame("downloadable content")),
-            TitleKind::Game => {}
+            TitleKind::Game | TitleKind::DlpChild => {}
         }
         let executable = cia.content(0).filter(|content| content.offset.is_some()).ok_or(FsError::NoExecutablePartition)?;
         if executable.encrypted() {

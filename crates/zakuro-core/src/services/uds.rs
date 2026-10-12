@@ -78,6 +78,46 @@ pub(crate) enum Wireless {
     Leave,
     /// data for a node of a network, or for all of them.
     Data { network_id: u32, channel: u8, from: u16, to: u16, payload: Vec<u8> },
+    /// a Download Play host's offer, every second while it takes guests.
+    DlpOffer(crate::services::dlp::Offer),
+    /// a guest asks to take part, with its node.
+    DlpJoin { node: Vec<u8> },
+    /// the host takes it in, as a node.
+    DlpTaken { node_id: u16 },
+    /// or turns it away, or sends it off.
+    DlpRefused,
+    /// the host starts sending the child.
+    DlpStart,
+    /// whether the guest needs the child sent.
+    DlpNeed { needs: bool },
+    /// a piece of the child.
+    DlpPiece { offset: u64, total: u64, data: Vec<u8> },
+    /// the guest has all of the child.
+    DlpReady,
+    /// the game begins, with the passphrase of the network the host puts up
+    /// for the children.
+    DlpBegin { passphrase: Vec<u8> },
+    /// either side leaves the session.
+    DlpLeave,
+}
+
+impl Wireless {
+    /// whether it is Download Play's, which the dlp service takes.
+    fn download_play(&self) -> bool {
+        matches!(
+            self,
+            Wireless::DlpOffer(_)
+                | Wireless::DlpJoin { .. }
+                | Wireless::DlpTaken { .. }
+                | Wireless::DlpRefused
+                | Wireless::DlpStart
+                | Wireless::DlpNeed { .. }
+                | Wireless::DlpPiece { .. }
+                | Wireless::DlpReady
+                | Wireless::DlpBegin { .. }
+                | Wireless::DlpLeave
+        )
+    }
 }
 
 /// a node of a network, its address and how its title describes it.
@@ -807,7 +847,14 @@ fn mac_text(mac: &Mac) -> String {
 /// what came through the room, the beacon due, and a join that took too long.
 pub fn tick(system: &mut System) {
     let Some(room) = system.room.clone() else { return };
-    let received = room.receive();
+    for (from, body) in room.receive() {
+        match postcard::from_bytes::<Wireless>(&body) {
+            Ok(message) if message.download_play() => crate::services::dlp::take(system, from, message),
+            Ok(message) if system.services.uds.initialized => take(system, from, message),
+            Ok(_) => {}
+            Err(error) => log::warn!("uds: {} sent something unreadable, {error}", mac_text(&from)),
+        }
+    }
     if !system.services.uds.initialized {
         return;
     }
@@ -815,12 +862,6 @@ pub fn tick(system: &mut System) {
         log::info!("uds: the room is gone, and the network with it");
         end(system, NOT_CONNECTED, LOST);
         return;
-    }
-    for (from, body) in received {
-        match postcard::from_bytes::<Wireless>(&body) {
-            Ok(message) => take(system, from, message),
-            Err(error) => log::warn!("uds: {} sent something unreadable, {error}", mac_text(&from)),
-        }
     }
     let now = system.cpu.cycles;
     let uds = &mut system.services.uds;
@@ -957,6 +998,8 @@ fn take(system: &mut System, from: Mac, message: Wireless) {
                 system.kernel.signal_event(event);
             }
         }
+        // the dlp service's, see tick
+        _ => {}
     }
 }
 

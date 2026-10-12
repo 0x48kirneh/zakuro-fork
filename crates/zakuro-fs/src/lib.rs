@@ -3,6 +3,7 @@
 //! .code.
 
 pub mod cia;
+pub mod dlp;
 pub mod exefs;
 pub mod layered;
 pub mod lz77;

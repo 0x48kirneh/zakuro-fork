@@ -25,6 +25,8 @@ pub struct Game {
     pub update: Option<Addon>,
     /// its DLC in the folder.
     pub dlc: Vec<Addon>,
+    /// its Download Play child, decrypted, which it sends guests.
+    pub dlp_child: Option<Addon>,
 }
 
 /// an update or DLC in the folder, which goes with the game of its id.
@@ -39,7 +41,10 @@ pub struct Addon {
 #[derive(Default)]
 pub struct Library {
     pub games: Vec<Game>,
-    scanning: Option<Receiver<Vec<Game>>>,
+    /// the Download Play children in the folder, decrypted, which let a
+    /// guest play along without the host sending one.
+    pub children: Vec<Addon>,
+    scanning: Option<Receiver<(Vec<Game>, Vec<Addon>)>>,
     /// set when the games changed and their icons need uploading.
     pub changed: bool,
     /// where the games' mods folders are.
@@ -71,8 +76,9 @@ impl Library {
     pub fn poll(&mut self) {
         let Some(receive) = &self.scanning else { return };
         match receive.try_recv() {
-            Ok(games) => {
+            Ok((games, children)) => {
                 self.games = games;
+                self.children = children;
                 self.scanning = None;
                 self.changed = true;
             }
@@ -89,14 +95,15 @@ impl Library {
     }
 }
 
-fn scan(folder: &Path, data_dir: Option<&Path>) -> Vec<Game> {
-    let Ok(entries) = std::fs::read_dir(folder) else { return Vec::new() };
+/// the games in folder, and the Download Play children.
+fn scan(folder: &Path, data_dir: Option<&Path>) -> (Vec<Game>, Vec<Addon>) {
+    let Ok(entries) = std::fs::read_dir(folder) else { return (Vec::new(), Vec::new()) };
     let paths = entries.filter_map(|entry| entry.ok().map(|entry| entry.path())).filter(|path| {
         path.extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| GAME_FILES.contains(&extension.to_ascii_lowercase().as_str()))
     });
-    let (mut games, mut addons) = (Vec::new(), Vec::new());
+    let (mut games, mut addons, mut children) = (Vec::new(), Vec::new(), Vec::new());
     for path in paths {
         match addon(&path) {
             Some(Ok(addon)) => addons.push(addon),
@@ -106,9 +113,18 @@ fn scan(folder: &Path, data_dir: Option<&Path>) -> Vec<Game> {
     }
     // each update and DLC goes with the game of its id, the newest update
     for addon in addons {
-        let update = zakuro_fs::TitleKind::of(addon.title_id) == zakuro_fs::TitleKind::Update;
+        let kind = zakuro_fs::TitleKind::of(addon.title_id);
+        let update = kind == zakuro_fs::TitleKind::Update;
+        if kind == zakuro_fs::TitleKind::DlpChild {
+            children.push(addon.clone());
+        }
         let game = games.iter_mut().find(|game| game.problem.is_none() && game.program_id & 0xFFFF_FFFF == addon.title_id & 0xFFFF_FFFF);
         match (game, update) {
+            (Some(game), false) if kind == zakuro_fs::TitleKind::DlpChild => game.dlp_child = Some(addon),
+            (None, false) if kind == zakuro_fs::TitleKind::DlpChild => games.push(unplayable(
+                &addon.path,
+                "A Download Play program, it plays from the Multiplayer window when a host offers its game".to_owned(),
+            )),
             (Some(game), true) => {
                 if game.update.as_ref().is_none_or(|known| known.version < addon.version) {
                     game.update = Some(addon);
@@ -121,7 +137,7 @@ fn scan(folder: &Path, data_dir: Option<&Path>) -> Vec<Game> {
     }
     // the ones that can't be played go last
     games.sort_by_key(|game| (game.problem.is_some(), game.name.to_lowercase()));
-    games
+    (games, children)
 }
 
 /// the update or DLC in the file at path, none when it holds neither, and
@@ -163,6 +179,7 @@ fn unplayable(path: &Path, problem: String) -> Game {
         problem: Some(problem),
         update: None,
         dlc: Vec::new(),
+        dlp_child: None,
     }
 }
 
@@ -194,6 +211,7 @@ fn read_game(path: &Path, data_dir: Option<&Path>) -> Game {
         problem: None,
         update: None,
         dlc: Vec::new(),
+        dlp_child: None,
     }
 }
 
@@ -215,10 +233,11 @@ fn problem(error: &zakuro_fs::FsError) -> String {
 }
 
 /// the part of a title's icon file the library shows.
-struct Smdh {
-    name: String,
+pub(crate) struct Smdh {
+    pub(crate) name: String,
     publisher: String,
-    icon: Vec<u8>,
+    /// RGBA, ICON_SIZE square.
+    pub(crate) icon: Vec<u8>,
 }
 
 impl Smdh {
@@ -230,7 +249,7 @@ impl Smdh {
     /// the 48 pixel icon, RGB565 in 8 by 8 tiles.
     const LARGE_ICON: usize = 0x24C0;
 
-    fn parse(data: &[u8]) -> Option<Smdh> {
+    pub(crate) fn parse(data: &[u8]) -> Option<Smdh> {
         if data.get(..4)? != b"SMDH" || data.len() < Self::LARGE_ICON + ICON_SIZE * ICON_SIZE * 2 {
             return None;
         }
@@ -348,14 +367,29 @@ mod tests {
         std::fs::write(folder.join("dlc.cia"), cia(dlc, 1, &[(0, Some(&ncch(dlc, None, &[])))])).unwrap();
         let orphan = 0x0004_000E_0000_0001u64;
         std::fs::write(folder.join("orphan.cia"), cia(orphan, 1, &[(0, Some(&ncch(orphan, Some(&[3; 8]), &[])))])).unwrap();
+        // Download Play children, the game's and one of a game not there
+        let child = 0x0004_0001_00AB_CD00u64;
+        std::fs::write(folder.join("child.cia"), cia(child, 0, &[(0, Some(&ncch(child, Some(&[4; 8]), &[])))])).unwrap();
+        let stray = 0x0004_0001_0000_0002u64;
+        std::fs::write(folder.join("stray.cia"), cia(stray, 0, &[(0, Some(&ncch(stray, Some(&[5; 8]), &[])))])).unwrap();
 
-        let games = scan(&folder, None);
+        let (games, children) = scan(&folder, None);
         let found = games.iter().find(|entry| entry.program_id == game).unwrap();
         assert_eq!(found.update.as_ref().map(|update| update.version), Some(0x0410));
         assert_eq!(found.dlc.len(), 1);
+        assert_eq!(found.dlp_child.as_ref().map(|addon| addon.title_id), Some(child));
+        let mut children: Vec<u64> = children.iter().map(|addon| addon.title_id).collect();
+        children.sort();
+        assert_eq!(children, [stray, child]);
         let unplayable: Vec<&str> = games.iter().filter_map(|entry| entry.problem.as_deref()).collect();
-        assert_eq!(unplayable, ["An update for a game that isn't in this folder"]);
-        assert_eq!(games.len(), 2);
+        assert_eq!(
+            unplayable,
+            [
+                "An update for a game that isn't in this folder",
+                "A Download Play program, it plays from the Multiplayer window when a host offers its game"
+            ]
+        );
+        assert_eq!(games.len(), 3);
         std::fs::remove_dir_all(folder).unwrap();
     }
 }

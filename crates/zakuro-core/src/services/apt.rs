@@ -423,9 +423,24 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             }
             true
         }
+        // GetWirelessRebootInfo(size), the host's address and passphrase a
+        // Download Play child connects with, into its static buffer
+        0x0045 => {
+            let info = system.config.wireless_reboot.unwrap_or([0; 16]);
+            let size = (buffer.get(&mut system.memory, 1) as usize).min(info.len());
+            let tls = system.kernel.current().map_or(0, |t| t.tls);
+            let (destination, capacity) = buffer.static_buffer(&mut system.memory, tls, 0);
+            let size = size.min(capacity as usize);
+            system.memory.write_bytes(destination, &info[..size]);
+            buffer.set(&mut system.memory, 0, Header::new(0x0045, 1, 2).0);
+            buffer.set(&mut system.memory, 1, 0);
+            buffer.set(&mut system.memory, 2, Descriptor::static_buffer(size as u32, 0));
+            buffer.set(&mut system.memory, 3, destination);
+            true
+        }
         // ReceiveDeliverArg / SetWirelessRebootInfo and the rest of the
         // hand-off machinery.
-        0x0035 | 0x0045 | 0x0046 | 0x0047 => {
+        0x0035 | 0x0046 | 0x0047 => {
             buffer.reply(&mut system.memory, command, &[0, 0]);
             true
         }

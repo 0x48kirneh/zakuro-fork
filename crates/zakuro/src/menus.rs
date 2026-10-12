@@ -36,6 +36,10 @@ pub enum Action {
     HostRoom,
     JoinRoom,
     LeaveRoom,
+    /// take part in the Download Play offer at this place in the list, or
+    /// leave the one taken part in.
+    DlpJoin(usize),
+    DlpLeave,
     Rescan,
     Resume,
     Reset,
@@ -82,6 +86,8 @@ pub struct Menus {
     /// the multiplayer window, and the password typed in it.
     pub multiplayer_open: bool,
     pub room_password: String,
+    /// the icons of the games offered for Download Play.
+    dlp_icons: HashMap<u64, egui::TextureHandle>,
     /// a report on the game, to copy from the message it goes with, and
     /// from no other.
     pub report: Option<(String, String)>,
@@ -101,6 +107,27 @@ pub struct RoomView {
     pub members: Vec<(String, String)>,
     /// the port of the room this program holds open, when it is its own.
     pub port: Option<u16>,
+    /// Download Play, while no game runs.
+    pub download_play: Option<DlpView>,
+}
+
+/// the Download Play offers in the room, and where the guest is.
+pub struct DlpView {
+    pub offers: Vec<OfferView>,
+    /// what the guest is doing, and how far along, while it takes part.
+    pub doing: Option<(String, Option<f32>)>,
+}
+
+pub struct OfferView {
+    pub child: u64,
+    pub title: String,
+    pub host: String,
+    /// RGBA, ICON_SIZE square.
+    pub icon: Option<Vec<u8>>,
+    pub guests: u8,
+    pub most: u8,
+    /// why the player can't take part, when they can't.
+    pub blocked: Option<String>,
 }
 
 /// the picture behind the library, decoded away from the interface.
@@ -538,6 +565,49 @@ impl Menus {
                     let leave = if room.port.is_some() { "Close the room" } else { "Leave the room" };
                     if ui.button(leave).clicked() {
                         actions.push(Action::LeaveRoom);
+                    }
+                    if let Some(download_play) = &room.download_play {
+                        ui.separator();
+                        ui.label(RichText::new("Download Play").strong());
+                        match &download_play.doing {
+                            Some((doing, progress)) => {
+                                ui.label(doing);
+                                if let Some(progress) = progress {
+                                    ui.add(egui::ProgressBar::new(*progress).show_percentage());
+                                }
+                                if ui.button("Leave").clicked() {
+                                    actions.push(Action::DlpLeave);
+                                }
+                            }
+                            None if download_play.offers.is_empty() => {
+                                ui.label(RichText::new("No one in the room offers a game to download. A game offers one from its own Download Play menu.").weak());
+                            }
+                            None => {
+                                for (index, offer) in download_play.offers.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        if let Some(pixels) = &offer.icon {
+                                            let texture = self.dlp_icons.entry(offer.child).or_insert_with(|| {
+                                                let image = egui::ColorImage::from_rgba_unmultiplied([ICON_SIZE, ICON_SIZE], pixels);
+                                                ui.ctx().load_texture(format!("download play {:016X}", offer.child), image, egui::TextureOptions::LINEAR)
+                                            });
+                                            ui.add(egui::Image::new(&*texture).fit_to_exact_size(Vec2::splat(32.0)));
+                                        }
+                                        ui.vertical(|ui| {
+                                            ui.label(RichText::new(&offer.title).strong());
+                                            ui.label(RichText::new(format!("from {}, {} of {} joined", offer.host, offer.guests, offer.most)).weak());
+                                        });
+                                        let join = ui.add_enabled(offer.blocked.is_none(), egui::Button::new("Join"));
+                                        let join = match &offer.blocked {
+                                            Some(why) => join.on_disabled_hover_text(why),
+                                            None => join,
+                                        };
+                                        if join.clicked() {
+                                            actions.push(Action::DlpJoin(index));
+                                        }
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
                 None => {

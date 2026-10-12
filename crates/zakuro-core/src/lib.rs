@@ -5,6 +5,7 @@ pub mod camera;
 pub mod cheats;
 pub mod enhancements;
 pub mod cro;
+pub mod download_play;
 pub mod hints;
 pub mod kernel;
 pub mod loader;
@@ -80,6 +81,12 @@ pub struct Config {
     /// the number that tells this console apart from others over local
     /// wireless, the configuration's block 0x00090000.
     pub console_id: u64,
+    /// the game's Download Play child decrypted, which a host sends its
+    /// guests. the one on a card is encrypted.
+    pub dlp_child: Option<std::path::PathBuf>,
+    /// what a Download Play child runs with, the host's address and the
+    /// passphrase of its network, APT:GetWirelessRebootInfo's answer.
+    pub wireless_reboot: Option<[u8; 16]>,
 }
 
 impl Default for Config {
@@ -105,6 +112,8 @@ impl Default for Config {
             interpolate: false,
             username: "Zakuro".into(),
             console_id: 0x5A4B_0000_0000_0001,
+            dlp_child: None,
+            wireless_reboot: None,
         }
     }
 }
@@ -738,6 +747,7 @@ impl System {
         services::ir::tick(self);
         services::cam::tick(self);
         services::uds::tick(self);
+        services::dlp::tick(self);
     }
 
     /// the stereo samples the console played since the last call, at

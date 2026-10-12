@@ -6,6 +6,7 @@ pub mod cam;
 pub mod cecd;
 pub mod err;
 pub mod cfg;
+pub mod dlp;
 pub mod dsp;
 pub mod dsp_aac;
 pub mod dsp_mixer;
@@ -77,6 +78,7 @@ pub struct ServiceState {
     pub boss: boss::BossState,
     pub cam: cam::CamState,
     pub uds: uds::UdsState,
+    pub dlp: dlp::DlpState,
     /// commands we logged as unimplemented, so the log stays readable and the
     /// diagnostics overlay can show what a title is actually asking for.
     pub unimplemented: BTreeMap<(String, u16), u32>,
@@ -117,6 +119,7 @@ pub fn handle_request(system: &mut System, target: Target) {
         "boss:U" | "boss:P" => boss::handle(system, &buffer, header),
         "cam:u" | "cam:s" => cam::handle(system, &buffer, header),
         "nwm::UDS" => uds::handle(system, &buffer, header),
+        "dlp:SRVR" => dlp::handle(system, &buffer, header),
         _ => misc::handle(system, &buffer, header, &name),
     };
 
@@ -135,6 +138,7 @@ fn is_network_service(name: &str) -> bool {
         name,
         "frd:u" | "frd:a"
             | "nwm::UDS"
+            | "dlp:SRVR"
             | "http:C"
             | "ssl:C"
             | "nim:aoc" | "nim:s" | "nim:u"
@@ -153,7 +157,7 @@ fn offline(system: &mut System, buffer: &CommandBuffer, header: Header, service:
         // a player can switch wireless off at any time, so a title knows
         // exactly what local wireless says then, a code from another module
         // is just a failure it never expected.
-        "nwm::UDS" => ("WIRELESS_OFF", errors::UDS_WIRELESS_OFF),
+        "nwm::UDS" | "dlp:SRVR" => ("WIRELESS_OFF", errors::UDS_WIRELESS_OFF),
         _ => ("NOT_CONNECTED", errors::NOT_CONNECTED),
     };
     let count = system
