@@ -265,11 +265,13 @@ impl System {
 
     // -- process setup ------------------------------------------------------
 
-    /// maps the page holding a thread's TLS block, if it is not mapped yet.
+    /// maps the page holding a thread's TLS block, if it is not mapped yet,
+    /// and clears the block, which a thread that ended may have used.
     pub fn map_tls_page(&mut self, thread: ThreadId) {
         let tls = self.kernel.thread(thread).tls;
         let page = tls & !PAGE_MASK;
         if self.memory.mapping_at(page).is_some() {
+            self.memory.write_bytes(tls, &[0; TLS_ENTRY_SIZE as usize]);
             return;
         }
         let Some(block) = self

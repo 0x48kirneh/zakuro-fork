@@ -138,6 +138,11 @@ impl ObjectStore {
         }
     }
 
+    /// how many hold the object, handles and the kernel's own holds alike.
+    pub(crate) fn refcount(&self, id: ObjectId) -> u32 {
+        self.slots.get(id.0 as usize).and_then(|s| s.as_ref()).map_or(0, |s| s.refcount)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (ObjectId, &KObject)> {
         self.slots
             .iter()

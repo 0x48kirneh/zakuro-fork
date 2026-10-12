@@ -402,7 +402,7 @@ fn create_thread(system: &mut System) {
     let processor_id = system.cpu.regs[4] as i32;
 
     let id = system.kernel.create_thread(
-        format!("thread{}", system.kernel.threads.len()),
+        format!("thread{}", system.kernel.next_guest_id),
         entry,
         stack_top,
         arg,
@@ -414,7 +414,8 @@ fn create_thread(system: &mut System) {
 
     let handle = system.kernel.thread_handle(id);
     log::debug!(
-        "svcCreateThread: thread{id} handle 0x{handle:X} priority {priority} core {processor_id} entry 0x{entry:08X} arg 0x{arg:08X} stack 0x{stack_top:08X}"
+        "svcCreateThread: {} handle 0x{handle:X} priority {priority} core {processor_id} entry 0x{entry:08X} arg 0x{arg:08X} stack 0x{stack_top:08X}",
+        system.kernel.thread(id).name
     );
     system.cpu.regs[0] = 0;
     system.cpu.regs[1] = handle;

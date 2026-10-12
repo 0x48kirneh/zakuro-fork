@@ -30,6 +30,10 @@ pub struct Kernel {
 
     /// next free slot in the TLS area.
     next_tls_slot: u32,
+    /// the TLS blocks of threads that ended, for the next threads made.
+    free_tls: std::collections::BTreeSet<VAddr>,
+    /// what svcGetThreadId gives the next thread, ids are never reused.
+    pub next_guest_id: u32,
 
     pub process_id: u32,
     pub program_id: u64,
@@ -75,6 +79,8 @@ impl Kernel {
             threads: Vec::new(),
             current_thread: None,
             next_tls_slot: 0,
+            free_tls: std::collections::BTreeSet::new(),
+            next_guest_id: 0,
             process_id: 0x22,
             program_id,
             memory_region,
@@ -94,8 +100,12 @@ impl Kernel {
 
     // -- threads ------------------------------------------------------------
 
-    /// allocates the next TLS page slot for a new thread.
+    /// allocates a TLS block for a new thread, the lowest one a thread that
+    /// ended gave back first.
     pub fn allocate_tls(&mut self) -> VAddr {
+        if let Some(addr) = self.free_tls.pop_first() {
+            return addr;
+        }
         let addr = TLS_AREA_VADDR + self.next_tls_slot * TLS_ENTRY_SIZE;
         self.next_tls_slot += 1;
         addr
@@ -110,9 +120,18 @@ impl Kernel {
         priority: u32,
         processor_id: i32,
     ) -> ThreadId {
-        let id = self.threads.len() as ThreadId;
+        // a thread that ended and that nothing names any more gives its place
+        // to the new one. Pokémon Sun starts one every other frame for local
+        // wireless, the table and every schedule would grow without end
+        let id = match self.ended_thread() {
+            Some(id) => {
+                self.forget_thread(id);
+                id
+            }
+            None => self.threads.len() as ThreadId,
+        };
         let tls = self.allocate_tls();
-        let thread = Thread::new(
+        let mut thread = Thread::new(
             id,
             name,
             entry,
@@ -122,13 +141,46 @@ impl Kernel {
             tls,
             processor_id,
         );
+        thread.guest_id = self.next_guest_id;
+        self.next_guest_id += 1;
         log::debug!(
             "created thread {id} '{}' entry=0x{entry:08X} sp=0x{stack_top:08X} prio={priority}",
             thread.name
         );
-        self.threads.push(thread);
+        match self.threads.get_mut(id as usize) {
+            Some(place) => *place = thread,
+            None => self.threads.push(thread),
+        }
         self.reschedule_pending = true;
         id
+    }
+
+    /// a thread that ended that no handle or wait names any more.
+    fn ended_thread(&self) -> Option<ThreadId> {
+        let unnamed = |id: ThreadId| {
+            self.thread_objects.get(&id).is_none_or(|&object| self.objects.refcount(object) <= 1)
+        };
+        (0..self.threads.len() as ThreadId).find(|&id| self.threads[id as usize].status == ThreadStatus::Dead && unnamed(id))
+    }
+
+    /// lets go of what still names a thread that ended before its place goes
+    /// to a new one, the object kept for its handles and the entries a wait
+    /// that timed out left on address arbiters.
+    fn forget_thread(&mut self, id: ThreadId) {
+        if let Some(object) = self.thread_objects.remove(&id) {
+            self.objects.release(object);
+        }
+        let arbiters: Vec<ObjectId> = self
+            .objects
+            .iter()
+            .filter(|(_, object)| matches!(object, KObject::AddressArbiter(_)))
+            .map(|(object, _)| object)
+            .collect();
+        for object in arbiters {
+            if let Some(KObject::AddressArbiter(arbiter)) = self.objects.get_mut(object) {
+                arbiter.waiters.retain(|&(thread, _)| thread != id);
+            }
+        }
     }
 
     pub fn thread(&self, id: ThreadId) -> &Thread {
@@ -544,6 +596,7 @@ impl Kernel {
         thread.status = ThreadStatus::Dead;
         thread.wait_result = None;
         thread.wait_syscall = None;
+        self.free_tls.insert(thread.tls);
         let held: Vec<ObjectId> = self
             .objects
             .iter()
@@ -699,5 +752,34 @@ mod tests {
         assert!(matches!(thread.wait_result, Some(WaitResult::Signaled(0))));
         let Some(KObject::Mutex(mutex)) = kernel.objects.get(object) else { panic!("the mutex is gone") };
         assert_eq!((mutex.owner, mutex.lock_count), (Some(waiter), 1));
+    }
+
+    /// a thread that ended gives its TLS block to the next thread made, and
+    /// its place too once its handle is closed, with a new id for the title.
+    /// Pokémon Sun starts and ends a thread every other frame.
+    #[test]
+    fn a_thread_that_ended_gives_its_place_to_the_next() {
+        let mut kernel = Kernel::new(0, MemoryRegion::Application, 0x1400_0000);
+        kernel.create_thread("main", 0x0010_0000, 0x1000_0000, 0, 0x30, 0);
+        let first = kernel.create_thread("first", 0x0010_0000, 0x0FF0_0000, 0, 0x30, 0);
+        let handle = kernel.thread_handle(first);
+        let tls = kernel.thread(first).tls;
+        kernel.end_thread(first);
+
+        // its handle still open, only the TLS block goes to the next
+        let second = kernel.create_thread("second", 0x0010_0000, 0x0FF0_0000, 0, 0x30, 0);
+        assert_ne!(second, first);
+        assert_eq!(kernel.thread(second).tls, tls);
+        kernel.end_thread(second);
+
+        assert!(kernel.handles.close(&mut kernel.objects, handle));
+        let third = kernel.create_thread("third", 0x0010_0000, 0x0FF0_0000, 0, 0x30, 0);
+        assert_eq!(third, first);
+        assert_eq!(kernel.thread(third).status, ThreadStatus::Ready);
+        assert_eq!(kernel.thread(third).guest_id, 3);
+        assert_eq!(kernel.thread(third).tls, tls);
+        // the new thread's own object, not the one the ended thread had
+        let object = kernel.thread_object(third);
+        assert_eq!(kernel.objects.refcount(object), 1);
     }
 }
