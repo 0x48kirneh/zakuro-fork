@@ -85,6 +85,46 @@ impl ShaderUnit {
         }
     }
 
+    /// what a saved state keeps of the unit, its program, its uniforms and
+    /// where the uploads to them are.
+    pub fn saved(&self) -> crate::state::UnitState {
+        crate::state::UnitState {
+            program: self.program.to_vec(),
+            descriptors: self.descriptors.to_vec(),
+            float_uniforms: self.float_uniforms.to_vec(),
+            int_uniforms: self.int_uniforms,
+            bool_uniforms: self.bool_uniforms,
+            entry_point: self.entry_point,
+            program_write_offset: self.program_write_offset as u32,
+            descriptor_write_offset: self.descriptor_write_offset as u32,
+            float_uniform_index: self.float_uniform_index as u32,
+            float_uniform_component: self.float_uniform_component as u32,
+            float_uniform_wide: self.float_uniform_wide,
+            float_uniform_staging: self.float_uniform_staging,
+        }
+    }
+
+    /// the unit as a saved state had it, false when it does not fit.
+    pub fn restore(&mut self, state: &crate::state::UnitState) -> bool {
+        if state.program.len() != PROGRAM_SIZE || state.descriptors.len() != DESCRIPTOR_SIZE || state.float_uniforms.len() != FLOAT_UNIFORMS {
+            return false;
+        }
+        self.program.copy_from_slice(&state.program);
+        self.descriptors.copy_from_slice(&state.descriptors);
+        self.float_uniforms.copy_from_slice(&state.float_uniforms);
+        self.int_uniforms = state.int_uniforms;
+        self.bool_uniforms = state.bool_uniforms;
+        self.entry_point = state.entry_point;
+        self.program_write_offset = state.program_write_offset as usize;
+        self.descriptor_write_offset = state.descriptor_write_offset as usize;
+        self.float_uniform_index = state.float_uniform_index as usize;
+        self.float_uniform_component = state.float_uniform_component as usize;
+        self.float_uniform_wide = state.float_uniform_wide;
+        self.float_uniform_staging = state.float_uniform_staging;
+        self.decoded = None;
+        true
+    }
+
     pub fn upload_program(&mut self, word: u32) {
         if self.program_write_offset < PROGRAM_SIZE {
             if self.program[self.program_write_offset] != word {

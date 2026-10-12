@@ -51,7 +51,7 @@ const STICK_CENTER: f32 = 2048.0;
 const STICK_REACH: f32 = 0x9C as f32 * 8.0 / CALIBRATION_SCALE;
 const CALIBRATION_SCALE: f32 = 0.625;
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct IrState {
     /// the block a title shares for the link's state and data.
     pub memory: Option<ObjectId>,
@@ -68,7 +68,7 @@ pub struct IrState {
 }
 
 /// the receive buffer's room and the packets in it.
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Receive {
     /// its size, the table of packets included, and how many the table holds.
     size: u32,

@@ -13,6 +13,7 @@ pub mod mods;
 pub mod replay;
 pub mod recompiled;
 pub mod services;
+pub mod state;
 
 use std::collections::{BTreeMap, BTreeSet};
 

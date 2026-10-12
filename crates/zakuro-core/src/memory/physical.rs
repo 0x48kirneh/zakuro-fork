@@ -3,7 +3,7 @@
 use zakuro_common::memory_map::*;
 
 /// which of the kernel's three FCRAM regions an allocation comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MemoryRegion {
     Application,
     System,
@@ -11,7 +11,7 @@ pub enum MemoryRegion {
 }
 
 /// a contiguous run of physical pages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PhysicalBlock {
     pub addr: u32,
     pub size: u32,
@@ -180,6 +180,38 @@ impl PhysicalMemory {
     }
 
     /// host slice backing a physical address range, if it is real memory.
+    /// the physical address a host pointer into one of the memories stands
+    /// for, the way the page tables hold it.
+    pub fn paddr_of(&self, pointer: *const u8) -> Option<u32> {
+        [
+            (VRAM_PADDR, &self.vram),
+            (DSP_RAM_PADDR, &self.dsp_ram),
+            (AXI_WRAM_PADDR, &self.axi_wram),
+            (FCRAM_PADDR, &self.fcram),
+        ]
+        .into_iter()
+        .find_map(|(base, store)| {
+            let offset = (pointer as usize).wrapping_sub(store.as_ptr() as usize);
+            (offset < store.len()).then(|| base + offset as u32)
+        })
+    }
+
+    /// which pages are allocated and how the regions split them, for a
+    /// saved state.
+    pub fn allocation(&self) -> (Vec<bool>, [(u32, u32); 3]) {
+        (self.allocated.clone(), self.regions)
+    }
+
+    /// the allocation a saved state had, false when it does not fit.
+    pub fn set_allocation(&mut self, allocated: Vec<bool>, regions: [(u32, u32); 3]) -> bool {
+        if allocated.len() != self.allocated.len() {
+            return false;
+        }
+        self.allocated = allocated;
+        self.regions = regions;
+        true
+    }
+
     pub fn host_slice_mut(&mut self, paddr: u32, size: u32) -> Option<&mut [u8]> {
         let (base, store): (u32, &mut Box<[u8]>) = match paddr {
             p if (VRAM_PADDR..VRAM_PADDR + VRAM_SIZE).contains(&p) => (VRAM_PADDR, &mut self.vram),

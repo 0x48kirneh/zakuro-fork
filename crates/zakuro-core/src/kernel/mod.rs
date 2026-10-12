@@ -22,6 +22,7 @@ pub const LOWEST_PRIORITY: u32 = 0x3F;
 /// get a share, four frames.
 const STARVATION_TICKS: u64 = 4 * crate::CYCLES_PER_FRAME;
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Kernel {
     pub objects: ObjectStore,
     pub handles: HandleTable,

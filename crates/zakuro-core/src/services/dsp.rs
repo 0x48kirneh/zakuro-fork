@@ -66,7 +66,7 @@ mod layout {
     pub const UNKNOWN_14: u16 = 0xAC5C;
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct DspState {
     pub component_loaded: bool,
     pub running: bool,
@@ -83,6 +83,7 @@ pub struct DspState {
     voices: super::dsp_voices::Voices,
     mixer: super::dsp_mixer::Mixer,
     /// what came out of the speakers since the frontend last took it.
+    #[serde(skip)]
     pub output: Vec<[i16; 2]>,
     pub(crate) aac: super::dsp_aac::Aac,
 }

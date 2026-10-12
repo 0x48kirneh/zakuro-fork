@@ -929,6 +929,22 @@ pub struct Resources {
 }
 
 impl Resources {
+    /// lets go of the textures decoded, what the last draws left to the
+    /// next and what the host's GPU drew, memory having been put back as a
+    /// saved state had it.
+    pub(crate) fn forget(&mut self) {
+        self.textures.forget();
+        self.tex_env = Default::default();
+        self.lighting = Default::default();
+        #[cfg(feature = "vulkan")]
+        {
+            self.semantics = Default::default();
+            if let Some(hardware) = self.hardware.as_mut() {
+                hardware.forget();
+            }
+        }
+    }
+
     /// what the next draws do for frame interpolation.
     pub(crate) fn set_pass(&mut self, pass: Pass) {
         #[cfg(feature = "vulkan")]
@@ -1048,6 +1064,13 @@ impl TextureCache {
     /// replaces textures with the pack's pictures from now on, or with none.
     pub fn set_pack(&mut self, pack: Option<Arc<crate::pack::Pack>>) {
         self.pack = pack;
+        self.entries.clear();
+        self.texels = 0;
+    }
+
+    /// lets go of every texture, memory having been put back as a saved
+    /// state had it.
+    pub fn forget(&mut self) {
         self.entries.clear();
         self.texels = 0;
     }

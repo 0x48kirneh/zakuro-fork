@@ -31,20 +31,20 @@ mod config {
 const AUX_MIX_SIZE: u32 = 4 * FRAME_SAMPLES as u32 * 4;
 
 /// addresses of the structures the mixer uses, in region 0.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Layout {
     pub configuration: u32,
     pub final_samples: u32,
     pub intermediate_samples: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Output {
     Mono,
     Stereo,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Mixer {
     /// how loud each intermediate mix comes out, the first being the master
     /// volume and the others the aux returns.
@@ -53,6 +53,7 @@ pub struct Mixer {
     aux: [bool; 2],
     output: Output,
     /// the mixes as they reach the output.
+    #[serde(with = "crate::state::arrays::nested")]
     mixes: [QuadFrame; 3],
 }
 

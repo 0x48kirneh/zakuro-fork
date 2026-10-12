@@ -60,7 +60,7 @@ impl Target {
 }
 
 /// per-service state that outlives a single request.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct ServiceState {
     pub srv: srv::SrvState,
     pub apt: apt::AptState,

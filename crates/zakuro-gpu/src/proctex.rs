@@ -55,7 +55,30 @@ fn replace<const N: usize>(entry: &mut [f32; N], value: [f32; N]) -> bool {
     changed
 }
 
+/// the tables as a saved state keeps them, the maps, the colors and their
+/// steps.
+pub(crate) type Saved = (Vec<[f32; 2]>, Vec<[f32; 4]>, Vec<[f32; 4]>);
+
 impl Tables {
+    /// the maps, the colors and their steps, for a saved state.
+    pub(crate) fn saved(&self) -> Saved {
+        (self.maps.iter().flatten().copied().collect(), self.colors.to_vec(), self.steps.to_vec())
+    }
+
+    /// what a saved state had, false when it does not fit.
+    pub(crate) fn restore(&mut self, maps: &[[f32; 2]], colors: &[[f32; 4]], steps: &[[f32; 4]]) -> bool {
+        if maps.len() != 3 * MAP_ENTRIES || colors.len() != COLOR_ENTRIES || steps.len() != COLOR_ENTRIES {
+            return false;
+        }
+        for (map, saved) in self.maps.iter_mut().zip(maps.chunks(MAP_ENTRIES)) {
+            map.copy_from_slice(saved);
+        }
+        self.colors.copy_from_slice(colors);
+        self.steps.copy_from_slice(steps);
+        self.generation += 1;
+        true
+    }
+
     /// takes a write to the table data registers, into the table and entry
     /// the index register names, which then moves on to the next entry.
     pub fn write(&mut self, registers: &mut [u32], value: u32) {

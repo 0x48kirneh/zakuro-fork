@@ -29,7 +29,7 @@ const SAMPLE_RATE: f32 = 60.0;
 
 bitflags::bitflags! {
     /// button bits exactly as the hardware reports them.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
     pub struct PadState: u32 {
         const A = 1 << 0;
         const B = 1 << 1;
@@ -61,7 +61,7 @@ bitflags::bitflags! {
 }
 
 /// what the frontend feeds in each frame.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct InputState {
     pub buttons: PadState,
     /// circle pad, -1.0 to 1.0 on each axis.
@@ -78,7 +78,7 @@ pub struct InputState {
     pub tilt: [f32; 2],
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct HidState {
     pub shared_memory_handle: Option<u32>,
     pub shared_memory_address: u32,

@@ -83,7 +83,7 @@ mod config {
 }
 
 /// addresses of the structures the voices use, in region 0.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Layout {
     pub configurations: u32,
     pub statuses: u32,
@@ -102,14 +102,14 @@ impl SampleMemory for Memory {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Format {
     Pcm8,
     Pcm16,
     Adpcm,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Interpolation {
     /// the firmware's polyphase filter, played as linear.
     Polyphase,
@@ -117,7 +117,7 @@ enum Interpolation {
     None,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct Buffer {
     address: u32,
     length: u32,
@@ -134,7 +134,7 @@ struct Buffer {
 }
 
 /// the first order filter, y = b0 x + a1 y1, with 15 fraction bits.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct SimpleFilter {
     b0: i32,
     a1: i32,
@@ -148,7 +148,7 @@ impl Default for SimpleFilter {
 }
 
 /// the second order filter, with 14 fraction bits and its feedback negated.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct BiquadFilter {
     b: [i32; 3],
     a: [i32; 2],
@@ -164,7 +164,7 @@ impl Default for BiquadFilter {
 
 /// what an ADPCM buffer was decoded from, its bytes and the coefficients
 /// and history the decoding started with, and the history it left.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct AdpcmSource {
     data: Vec<u8>,
     count: usize,
@@ -173,7 +173,7 @@ struct AdpcmSource {
     end: [i16; 2],
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct Filters {
     simple: Option<SimpleFilter>,
     biquad: Option<BiquadFilter>,
@@ -206,7 +206,7 @@ impl Filters {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Voice {
     enabled: bool,
     sync_count: u16,
@@ -242,6 +242,7 @@ struct Voice {
     /// where in its buffer the voice was at the start of the frame.
     position: u32,
     /// what the voice played this frame.
+    #[serde(with = "crate::state::arrays")]
     frame: Frame,
     /// the buffer ran out on the frame's last sample, so the next one
     /// waiting follows on from the next frame's first, as on the console,
@@ -641,7 +642,7 @@ fn decode_adpcm(data: &[u8], count: usize, coefficients: &[i16; 16], history: &m
     *history = [yn1 as i16, yn2 as i16];
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Voices {
     voices: Vec<Voice>,
 }

@@ -14,7 +14,7 @@ const SCANNING: u32 = 2;
 /// what CommunicationGetStatus reports once the reader is up.
 const COMMUNICATION_READY: u32 = 2;
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct NfcState {
     tag_state: u32,
     /// the tag in range and out of range events.

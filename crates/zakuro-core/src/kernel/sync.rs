@@ -5,7 +5,7 @@ use zakuro_common::VAddr;
 use super::thread::ThreadId;
 
 /// how an event or a timer behaves once a waiter picks it up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ResetType {
     /// releases exactly one waiter and clears itself.
     OneShot,
@@ -26,7 +26,7 @@ impl ResetType {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Event {
     pub name: String,
     pub reset_type: ResetType,
@@ -43,7 +43,7 @@ impl Event {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Mutex {
     pub name: String,
     pub owner: Option<ThreadId>,
@@ -62,14 +62,14 @@ impl Mutex {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Semaphore {
     pub name: String,
     pub count: i32,
     pub max_count: i32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Timer {
     pub name: String,
     pub reset_type: ResetType,
@@ -82,7 +82,7 @@ pub struct Timer {
 
 /// an address arbiter is the 3DS's futex, threads sleep on a guest address and
 /// are woken by whoever writes to it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AddressArbiter {
     pub name: String,
     /// threads currently parked, in the order they arrived.

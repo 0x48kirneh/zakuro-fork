@@ -20,7 +20,7 @@ pub(crate) const APPLICATION: u32 = 0x300;
 /// may have running.
 const ANY_LIBRARY_APPLET: u32 = 0x400;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Parameter {
     pub sender: u32,
     pub destination: u32,
@@ -30,7 +30,7 @@ pub struct Parameter {
     pub object: Option<ObjectId>,
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct AptState {
     pub lock: Option<u32>,
     pub notification_event: Option<u32>,

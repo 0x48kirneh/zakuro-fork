@@ -3881,6 +3881,24 @@ impl Hardware {
         self.wait()
     }
 
+    /// lets go of what the GPU drew that guest memory lacks, memory having
+    /// been put back as a saved state had it. each buffer takes memory's
+    /// bytes at its next use.
+    pub(crate) fn forget(&mut self) {
+        for surface in &mut self.surfaces {
+            surface.untwin();
+            surface.shadow.clear();
+            surface.pixel = None;
+            surface.dirty = None;
+            surface.guarded = None;
+            surface.write_guarded = None;
+            surface.cleared = None;
+            surface.stale = None;
+            surface.checked = false;
+            surface.replaced();
+        }
+    }
+
     /// makes guest memory right over a range something other than a draw
     /// is about to read or write, what the GPU drew there comes down, and
     /// the next draw looks at the memory again.

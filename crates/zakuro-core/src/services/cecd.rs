@@ -10,6 +10,7 @@ use crate::System;
 const WORKING: u32 = 0;
 const IDLE: u32 = 1;
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct CecdState {
     state: u32,
     /// the info changed and state changed events.

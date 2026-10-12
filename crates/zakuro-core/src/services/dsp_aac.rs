@@ -29,8 +29,10 @@ const ADTS_RATES: [u32; 13] = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 
 
 /// the decoder, kept between requests since each frame overlaps the one
 /// before, with the stream it was made for.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct Aac {
+    /// made again after a saved state, a frame of overlap short
+    #[serde(skip)]
     decoder: Option<(AacDecoder, (u32, u32))>,
 }
 

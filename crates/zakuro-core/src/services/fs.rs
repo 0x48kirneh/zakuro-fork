@@ -41,7 +41,7 @@ const SYSTEM_FILE_TLS_ROOT_CERTIFICATES: u32 = 0x0001_0602;
 const SYSTEM_FILE_SHARED_FONT: u32 = 0x0001_4002;
 
 /// which title an NCCH-archive path points at.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct NcchArchivePath {
     pub low_program_id: u32,
     pub high_program_id: u32,
@@ -129,7 +129,58 @@ pub struct OpenFile {
     pub backing: FileBacking,
 }
 
-#[derive(Debug, Clone)]
+/// an open file as a saved state keeps it, the ROM image it reads by its
+/// place among the title's, see state::images.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SavedFile {
+    path: String,
+    backing: SavedBacking,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+enum SavedBacking {
+    RomImage { image: u32, offset: u64, size: u64 },
+    Host(PathBuf),
+    Memory(Vec<u8>),
+    Layered { layered: u32, image: u32 },
+}
+
+type Images<'a> = (&'a [std::sync::Arc<zakuro_fs::RomImage>], &'a [std::sync::Arc<zakuro_fs::layered::Layered>]);
+
+impl OpenFile {
+    /// the file as a saved state keeps it, none when it reads an image the
+    /// title does not have.
+    pub fn save(&self, (images, layers): Images) -> Option<SavedFile> {
+        let place = |image: &std::sync::Arc<zakuro_fs::RomImage>| images.iter().position(|known| std::sync::Arc::ptr_eq(known, image)).map(|i| i as u32);
+        let backing = match &self.backing {
+            FileBacking::RomImage { image, offset, size } => SavedBacking::RomImage { image: place(image)?, offset: *offset, size: *size },
+            FileBacking::Host(path) => SavedBacking::Host(path.clone()),
+            FileBacking::Memory(bytes) => SavedBacking::Memory(bytes.clone()),
+            FileBacking::Layered(layered, image) => SavedBacking::Layered {
+                layered: layers.iter().position(|known| std::sync::Arc::ptr_eq(known, layered))? as u32,
+                image: place(image)?,
+            },
+        };
+        Some(SavedFile { path: self.path.clone(), backing })
+    }
+}
+
+impl SavedFile {
+    /// the file open again, on the title's images.
+    pub fn open(self, (images, layers): Images) -> Option<OpenFile> {
+        let backing = match self.backing {
+            SavedBacking::RomImage { image, offset, size } => FileBacking::RomImage { image: images.get(image as usize)?.clone(), offset, size },
+            SavedBacking::Host(path) => FileBacking::Host(path),
+            SavedBacking::Memory(bytes) => FileBacking::Memory(bytes),
+            SavedBacking::Layered { layered, image } => {
+                FileBacking::Layered(layers.get(layered as usize)?.clone(), images.get(image as usize)?.clone())
+            }
+        };
+        Some(OpenFile { path: self.path, backing })
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OpenArchive {
     pub id: u32,
     /// for [ARCHIVE_NCCH], which title the archive was opened on, a file
@@ -141,17 +192,21 @@ pub struct OpenArchive {
 
 /// an open directory, its listing, taken when it was opened, and how much
 /// of it has been read.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OpenDirectory {
     entries: Vec<DirectoryEntry>,
     cursor: usize,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct FsState {
-    /// where the writable archives live on the host.
+    /// where the writable archives live on the host, this run's.
+    #[serde(skip)]
     pub user_dir: PathBuf,
     pub archives: HashMap<u64, OpenArchive>,
     pub next_archive: u64,
+    /// the files, which a saved state keeps apart, see SavedFile.
+    #[serde(skip)]
     pub files: HashMap<u32, OpenFile>,
     pub next_file: u32,
     pub directories: HashMap<u32, OpenDirectory>,

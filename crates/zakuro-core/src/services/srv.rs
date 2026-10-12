@@ -5,7 +5,7 @@ use crate::kernel::object::{ClientSession, KObject};
 use crate::kernel::sync::ResetType;
 use crate::System;
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct SrvState {
     /// handle of the notification semaphore, created on demand.
     pub notification_semaphore: Option<u32>,

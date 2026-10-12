@@ -26,7 +26,7 @@ const TEXT_LENGTH: usize = 0x148;
 const CONFIG_SIZE: usize = 0x14C;
 
 /// what a title asks the keyboard for.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Request {
     pub hint: String,
     /// the text the keyboard starts with.
@@ -39,7 +39,7 @@ pub struct Request {
     pub valid: Valid,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Valid {
     Anything,
     NotEmpty,
@@ -78,6 +78,7 @@ impl Request {
 }
 
 /// a keyboard a title started and waits on.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Pending {
     pub request: Request,
     config: Vec<u8>,

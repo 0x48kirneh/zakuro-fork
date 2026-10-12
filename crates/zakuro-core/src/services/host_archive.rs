@@ -36,7 +36,7 @@ impl FormatInfo {
 }
 
 /// one entry of a directory listing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DirectoryEntry {
     pub name: String,
     pub is_directory: bool,
@@ -45,7 +45,7 @@ pub struct DirectoryEntry {
 
 /// a writable archive, a host directory standing in for one of the
 /// console's save filesystems.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HostArchive {
     root: PathBuf,
 }

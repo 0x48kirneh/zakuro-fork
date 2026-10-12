@@ -14,6 +14,7 @@ jit = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-jit", "
 [dependencies]
 zakuro-common.workspace = true
 log.workspace = true
+serde.workspace = true
 bitflags.workspace = true
 thiserror.workspace = true
 rayon.workspace = true

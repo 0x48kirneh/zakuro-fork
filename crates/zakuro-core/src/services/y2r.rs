@@ -19,13 +19,14 @@ const STANDARD: [[i32; 8]; 4] = [
 
 /// a buffer a conversion reads from or writes to, in pieces of transfer
 /// bytes with gap bytes skipped after each.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 struct Buffer {
     address: u32,
     transfer: u16,
     gap: u16,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Y2rState {
     input_format: u32,
     output_format: u32,
@@ -46,6 +47,7 @@ pub struct Y2rState {
     output: Buffer,
     /// signalled at the end of each conversion.
     event: Option<ObjectId>,
+    #[serde(skip)]
     scratch: Scratch,
 }
 

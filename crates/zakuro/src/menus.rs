@@ -29,6 +29,9 @@ pub enum Action {
     ChooseBackground,
     /// pick the picture the cameras see.
     ChooseCameraPicture,
+    /// save the game's state to the slot chosen, or load it from there.
+    SaveState,
+    LoadState,
     Rescan,
     Resume,
     Reset,
@@ -67,6 +70,11 @@ pub struct Menus {
     pub rebinding_pad: Option<usize>,
     /// something to tell the user, until they close it.
     pub message: Option<String>,
+    /// something to tell the user for a moment, over the game, and since
+    /// when.
+    pub toast: Option<(String, std::time::Instant)>,
+    /// the slot states are saved to and loaded from, 1 to 9.
+    pub slot: u8,
     /// a report on the game, to copy from the message it goes with, and
     /// from no other.
     pub report: Option<(String, String)>,
@@ -302,9 +310,34 @@ impl Menus {
 
     /// what goes over a running game, the menu when it is open and the
     /// frame rate when asked for.
-    pub fn game(&mut self, ui: &mut egui::Ui, name: &str, fps: Option<f32>, recompiled: bool, fast: bool, jobs: &[Job]) -> Vec<Action> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn game(
+        &mut self,
+        ui: &mut egui::Ui,
+        name: &str,
+        fps: Option<f32>,
+        recompiled: bool,
+        fast: bool,
+        jobs: &[Job],
+        saved: Option<&str>,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
         let ctx = ui.ctx().clone();
+        if let Some((text, since)) = &self.toast {
+            if since.elapsed() < std::time::Duration::from_millis(2500) {
+                egui::Area::new(egui::Id::new("toast"))
+                    .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 8.0))
+                    .interactable(false)
+                    .show(&ctx, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.label(text);
+                        });
+                    });
+                ctx.request_repaint();
+            } else {
+                self.toast = None;
+            }
+        }
         if fast {
             egui::Area::new(egui::Id::new("fast forward"))
                 .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-8.0, 8.0))
@@ -344,6 +377,24 @@ impl Menus {
                 if wide(ui, "Fullscreen") {
                     actions.push(Action::Fullscreen);
                 }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut self.slot).range(1..=9).prefix("Slot "));
+                    ui.label(RichText::new(saved.unwrap_or("empty")).weak());
+                });
+                ui.horizontal(|ui| {
+                    if ui.add_sized([98.0, 28.0], egui::Button::new("Save state")).on_hover_text("F5 saves to this slot while playing.").clicked() {
+                        actions.push(Action::SaveState);
+                    }
+                    if ui
+                        .add_enabled(saved.is_some(), egui::Button::new("Load state").min_size(Vec2::new(98.0, 28.0)))
+                        .on_hover_text("F8 loads this slot while playing.")
+                        .clicked()
+                    {
+                        actions.push(Action::LoadState);
+                    }
+                });
+                ui.add_space(4.0);
                 if wide(ui, "Settings") {
                     self.settings_open = true;
                 }

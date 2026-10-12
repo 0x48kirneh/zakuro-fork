@@ -13,7 +13,7 @@ pub use physical::{MemoryRegion, PhysicalBlock, PhysicalMemory};
 
 bitflags::bitflags! {
     /// page permissions as svcQueryMemory reports them.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct Permission: u32 {
         const READ = 1;
         const WRITE = 2;
@@ -27,7 +27,7 @@ impl Permission {
 }
 
 /// MemoryState as the kernel reports it through svcQueryMemory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u32)]
 pub enum MemoryState {
     Free = 0,
@@ -45,7 +45,7 @@ pub enum MemoryState {
 }
 
 /// one contiguous virtual mapping.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Mapping {
     pub base: VAddr,
     pub size: u32,
@@ -123,7 +123,67 @@ pub struct GpuSync {
 // the system that set it runs the CPU.
 unsafe impl Send for Memory {}
 
+/// what a saved state keeps of the memory map, the memory's bytes apart.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct MapState {
+    mappings: Vec<Mapping>,
+    /// each page mapped, and the physical pages its reads and writes go
+    /// to, NO_PAGE where they go nowhere.
+    pages: Vec<(u32, u32, u32)>,
+    allocated: Vec<bool>,
+    regions: [(u32, u32); 3],
+}
+
+/// a page reads or writes nothing.
+const NO_PAGE: u32 = u32::MAX;
+
 impl Memory {
+    /// the memory map as a saved state keeps it.
+    pub fn save_map(&self) -> MapState {
+        let paddr = |pointer: *mut u8| if pointer.is_null() { NO_PAGE } else { self.phys.paddr_of(pointer).unwrap_or(NO_PAGE) };
+        let pages = (0..PAGE_TABLE_ENTRIES)
+            .filter(|&page| !self.read_table[page].is_null() || !self.write_table[page].is_null())
+            .map(|page| (page as u32, paddr(self.read_table[page]), paddr(self.write_table[page])))
+            .collect();
+        let (allocated, regions) = self.phys.allocation();
+        MapState { mappings: self.mappings.values().copied().collect(), pages, allocated, regions }
+    }
+
+    /// the memory map as a saved state had it, with nothing the GPU drew
+    /// held back from the CPU.
+    pub fn load_map(&mut self, state: MapState) -> Result<(), String> {
+        if !self.phys.set_allocation(state.allocated, state.regions) {
+            return Err("the console's memory is not the size the state has".into());
+        }
+        for table in [&mut self.read_table, &mut self.write_table, &mut self.cpu_read_table, &mut self.cpu_write_table] {
+            table.fill(std::ptr::null_mut());
+        }
+        self.guards.clear();
+        self.write_guards.clear();
+        self.gpu_sync = None;
+        self.faults.clear();
+        for (page, read, write) in state.pages {
+            let page = page as usize;
+            if page >= PAGE_TABLE_ENTRIES {
+                return Err("a page of the state is past the memory map".into());
+            }
+            for (paddr, tables) in [(read, [0, 2]), (write, [1, 3])] {
+                if paddr == NO_PAGE {
+                    continue;
+                }
+                let Some(host) = self.phys.host_slice_mut(paddr, PAGE_SIZE) else {
+                    return Err(format!("the state maps a page to 0x{paddr:08X}, where there is no memory"));
+                };
+                let pointer = host.as_mut_ptr();
+                for table in tables {
+                    [&mut self.read_table, &mut self.write_table, &mut self.cpu_read_table, &mut self.cpu_write_table][table][page] = pointer;
+                }
+            }
+        }
+        self.mappings = state.mappings.into_iter().map(|mapping| (mapping.base, mapping)).collect();
+        Ok(())
+    }
+
     pub fn new(new3ds: bool, app_bytes: u32) -> Memory {
         Memory {
             phys: PhysicalMemory::new(new3ds, app_bytes),

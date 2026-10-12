@@ -16,7 +16,7 @@ const ENTRY_COUNT: u32 = 8;
 /// how far the C-stick reports each way.
 const C_STICK_RANGE: f32 = 0x9C as f32;
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct IrRstState {
     /// the block and its physical address, and the event each update
     /// signals, made when a title first asks, which may be before it

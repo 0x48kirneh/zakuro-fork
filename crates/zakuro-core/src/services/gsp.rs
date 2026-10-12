@@ -42,13 +42,13 @@ pub enum InterruptId {
 }
 
 /// one entry from the GX command ring.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct GxCommand {
     pub id: u8,
     pub data: [u32; 7],
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct GspState {
     pub shared_memory_handle: Option<u32>,
     pub shared_memory_address: u32,

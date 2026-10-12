@@ -70,7 +70,11 @@ pub fn run(linked: Option<Linked>) {
         library: Library::new(data_dir.clone()),
         data_dir,
         game: None,
-        menus: Menus::default(),
+        menus: {
+            let mut menus = Menus::default();
+            menus.slot = 1;
+            menus
+        },
         jobs: Vec::new(),
         gui: None,
         backend: None,
@@ -146,6 +150,20 @@ fn default_data_dir() -> Option<PathBuf> {
         var("XDG_DATA_HOME").or_else(|| var("HOME").map(|home| home.join(".local/share")))
     };
     dir.map(|dir| dir.join("zakuro"))
+}
+
+/// how long ago a state was saved, as a person would say it.
+fn ago(time: std::time::SystemTime) -> String {
+    let seconds = time.elapsed().map_or(0, |elapsed| elapsed.as_secs());
+    match seconds {
+        0..60 => "saved just now".into(),
+        60..120 => "saved a minute ago".into(),
+        120..3600 => format!("saved {} minutes ago", seconds / 60),
+        3600..7200 => "saved an hour ago".into(),
+        7200..86400 => format!("saved {} hours ago", seconds / 3600),
+        86400..172800 => "saved yesterday".into(),
+        _ => format!("saved {} days ago", seconds / 86400),
+    }
 }
 
 /// saves Zakuro kept in the working directory before it had a place for
@@ -676,6 +694,8 @@ impl App {
                     self.apply_layout();
                 }
                 KeyCode::F11 => self.toggle_fullscreen(),
+                KeyCode::F5 if self.game.is_some() => self.save_state(),
+                KeyCode::F8 if self.game.is_some() => self.load_state(),
                 _ => {}
             }
         }
@@ -951,6 +971,8 @@ impl App {
                     self.library.scan(&folder);
                 }
             }
+            Action::SaveState => self.save_state(),
+            Action::LoadState => self.load_state(),
             Action::ChooseCameraPicture => {
                 let picked = rfd::FileDialog::new()
                     .set_title("A picture for the cameras")
@@ -1198,6 +1220,62 @@ impl App {
         }
     }
 
+    /// the file of a slot of the running game's saved states.
+    fn state_path(&self, slot: u8) -> Option<PathBuf> {
+        let program_id = self.game.as_ref()?.system.title.as_ref()?.program_id();
+        Some(self.data_dir.as_ref()?.join("states").join(format!("{program_id:016X}")).join(format!("{slot}.state")))
+    }
+
+    /// saves the running game's state to the slot chosen.
+    fn save_state(&mut self) {
+        let slot = self.menus.slot;
+        let Some(path) = self.state_path(slot) else { return };
+        let Some(game) = &mut self.game else { return };
+        let started = Instant::now();
+        let saved = game.system.save_state().and_then(|bytes| {
+            let parent = path.parent().expect("a state's file is in a folder");
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            // written beside it first, a state cut short never takes the
+            // place of a whole one
+            let partial = path.with_extension("state.new");
+            std::fs::write(&partial, &bytes).and_then(|()| std::fs::rename(&partial, &path)).map_err(|error| error.to_string())
+        });
+        match saved {
+            Ok(()) => {
+                log::info!("saved the state to {} in {:?}", path.display(), started.elapsed());
+                self.menus.toast = Some((format!("Saved to slot {slot}"), Instant::now()));
+            }
+            Err(error) => self.menus.message = Some(format!("The state could not be saved, {error}")),
+        }
+        // the time it took is not the game's to make up
+        self.next_frame = Instant::now();
+    }
+
+    /// loads the running game's state from the slot chosen.
+    fn load_state(&mut self) {
+        let slot = self.menus.slot;
+        let Some(path) = self.state_path(slot) else { return };
+        let Some(game) = &mut self.game else { return };
+        let loaded = std::fs::read(&path)
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::NotFound => format!("Slot {slot} has no state saved."),
+                _ => format!("The state could not be read, {error}"),
+            })
+            .and_then(|bytes| game.system.load_state(&bytes).map_err(|error| format!("The state could not be loaded, {error}.")));
+        match loaded {
+            Ok(()) => {
+                log::info!("loaded the state from {}", path.display());
+                self.menus.toast = Some((format!("Loaded slot {slot}"), Instant::now()));
+                self.menus.menu_open = false;
+                if let Some(audio) = &self.audio {
+                    audio.clear();
+                }
+            }
+            Err(error) => self.menus.message = Some(error),
+        }
+        self.next_frame = Instant::now();
+    }
+
     /// the file of the running game's cheats.
     fn cheats_path(&self) -> Option<PathBuf> {
         let program_id = self.game.as_ref()?.system.title.as_ref()?.program_id();
@@ -1214,6 +1292,14 @@ impl App {
 
     /// the menus, and the actions they asked for, done.
     fn interface(&mut self, event_loop: &ActiveEventLoop) -> Overlay {
+        // when the slot chosen was saved to, while the menu shows it
+        let saved = self
+            .menus
+            .menu_open
+            .then(|| self.state_path(self.menus.slot))
+            .flatten()
+            .and_then(|path| std::fs::metadata(path).ok()?.modified().ok())
+            .map(ago);
         let (Some(gui), Some(window)) = (&mut self.gui, &self.window) else { return Overlay::default() };
         let show_fps = self.settings.show_fps;
         let game = self.game.as_ref().map(|game| (game.name.clone(), game.fps, game.system.recompiled.is_some()));
@@ -1227,7 +1313,7 @@ impl App {
         let overlay = gui.frame(window, |ui| {
             match &game {
                 Some((name, fps, recompiled)) => {
-                    actions.extend(menus.game(ui, name, show_fps.then_some(*fps), *recompiled, fast, jobs))
+                    actions.extend(menus.game(ui, name, show_fps.then_some(*fps), *recompiled, fast, jobs, saved.as_deref()))
                 }
                 None => actions.extend(menus.library(ui, library, settings, jobs)),
             }

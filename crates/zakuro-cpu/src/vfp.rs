@@ -11,7 +11,7 @@ const FPSCR_FZ: u32 = 1 << 24;
 /// default NaN mode.
 const FPSCR_DN: u32 = 1 << 25;
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Vfp {
     /// s0..s31 as raw bits. dN occupies s(2N) (low word) and s(2N+1).
     pub regs: [u32; 32],

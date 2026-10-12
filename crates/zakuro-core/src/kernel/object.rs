@@ -15,10 +15,10 @@ pub const CURRENT_PROCESS: Handle = 0xFFFF_8001;
 pub const CURRENT_THREAD: Handle = 0xFFFF_8000;
 
 /// index into the kernel's object slab.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct ObjectId(pub u32);
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum KObject {
     Thread(ThreadId),
     Event(Event),
@@ -55,7 +55,7 @@ impl KObject {
 
 /// a block of memory shared between processes, or between a process and a
 /// service. GSP and HID both hand one of these to the game.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SharedMemory {
     pub name: String,
     /// address in the owning process, or 0 when the kernel picks.
@@ -67,7 +67,7 @@ pub struct SharedMemory {
 }
 
 /// the game's end of a connection to a service.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ClientSession {
     /// which HLE service handles requests on this session.
     pub service: String,
@@ -76,14 +76,14 @@ pub struct ClientSession {
 }
 
 /// one slab entry.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct Slot {
     object: KObject,
     /// number of handles naming this object.
     refcount: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ObjectStore {
     slots: Vec<Option<Slot>>,
     free: Vec<u32>,
@@ -151,7 +151,7 @@ impl ObjectStore {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct HandleTable {
     entries: HashMap<Handle, ObjectId>,
     next: Handle,

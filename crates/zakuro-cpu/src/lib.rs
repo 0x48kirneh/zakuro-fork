@@ -51,7 +51,8 @@ pub const PC: usize = 15;
 pub const LR: usize = 14;
 pub const SP: usize = 13;
 
-#[derive(Clone)]
+/// all of it kept in a saved state.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Cpu {
     /// r0-r15 for the current mode.
     pub regs: [u32; 16],

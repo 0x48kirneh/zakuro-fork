@@ -1,6 +1,6 @@
 //! system control coprocessor.
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Cp15 {
     /// c13,c0,2, user read/write thread ID.
     pub thread_id_rw: u32,

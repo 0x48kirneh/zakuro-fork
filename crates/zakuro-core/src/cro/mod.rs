@@ -11,7 +11,7 @@ use crate::memory::Memory;
 use format::*;
 
 /// a module the loader has linked in.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Module {
     pub name: String,
     pub base: VAddr,
@@ -25,7 +25,7 @@ pub struct Module {
     pub auto_link: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct CroManager {
     /// the static module, which holds the symbols the main executable exports.
     pub crs: Option<VAddr>,
@@ -41,7 +41,7 @@ pub struct CroManager {
 
 /// a module running from memory of its own rather than from the title's
 /// buffer.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Copy {
     pub buffer: VAddr,
     pub block: crate::memory::physical::PhysicalBlock,

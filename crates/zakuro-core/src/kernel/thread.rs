@@ -22,7 +22,7 @@ pub const fn ticks_to_nanos(ticks: u64) -> u64 {
 }
 
 /// everything that has to be saved across a context switch.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ThreadContext {
     pub regs: [u32; 16],
     pub cpsr: Psr,
@@ -83,7 +83,7 @@ impl ThreadContext {
 /// the return address the kernel gives a fresh thread.
 pub const THREAD_EXIT_MAGIC: u32 = 0xFFFF_FFF0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ThreadStatus {
     Running,
     Ready,
@@ -107,7 +107,7 @@ impl ThreadStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Thread {
     pub id: ThreadId,
     pub name: String,
@@ -143,7 +143,7 @@ pub struct Thread {
 
 /// which syscall put a thread to sleep, so the scheduler knows how to write
 /// the result back when it wakes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WaitSyscall {
     WaitSynchronization1,
     WaitSynchronizationN,
@@ -152,7 +152,7 @@ pub enum WaitSyscall {
 }
 
 /// why a blocked thread woke up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WaitResult {
     /// the wait succeeded, the value is the index of the object that did it.
     Signaled(usize),

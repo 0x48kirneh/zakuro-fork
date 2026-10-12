@@ -3,7 +3,7 @@
 use zakuro_common::bits::bit;
 
 /// ARM processor modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum Mode {
     User = 0b10000,
@@ -33,7 +33,7 @@ impl Mode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Psr {
     pub n: bool,
     pub z: bool,

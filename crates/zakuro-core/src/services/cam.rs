@@ -32,7 +32,7 @@ const SEPIA_01: u8 = 5;
 const VSYNC_TIMINGS: usize = 5;
 
 /// what a camera puts out in each of its two contexts.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Context {
     width: u16,
     height: u16,
@@ -47,7 +47,7 @@ impl Default for Context {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct Camera {
     contexts: [Context; 2],
     context: usize,
@@ -56,7 +56,7 @@ struct Camera {
 
 /// a port, the camera on it, what it captures and where the next picture
 /// goes.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 struct Port {
     camera: Option<usize>,
     capturing: bool,
@@ -79,7 +79,7 @@ const RECEIVED: usize = 0;
 const VSYNC: usize = 1;
 const BUFFER_ERROR: usize = 2;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct CamState {
     cameras: [Camera; CAMERAS],
     ports: [Port; PORTS],
@@ -503,7 +503,7 @@ fn set_contexts(system: &mut System, cameras_select: u32, contexts_select: u32, 
 }
 
 /// tells the frontend's camera whether any port captures.
-fn capturing(system: &mut System) {
+pub(crate) fn capturing(system: &mut System) {
     let on = system.services.cam.ports.iter().any(|port| port.capturing);
     if let Some(camera) = &mut system.camera {
         camera.capturing(on);

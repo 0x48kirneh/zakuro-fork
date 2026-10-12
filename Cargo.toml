@@ -25,7 +25,8 @@ zakuro-core   = { path = "crates/zakuro-core" }
 
 log = "0.4"
 thiserror = "2"
-bitflags = "2"
+bitflags = { version = "2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
 recomp-abi = { git = "https://github.com/fearkov/3dsrecomp" }
 rayon = "1"
 memmap2 = "0.9"

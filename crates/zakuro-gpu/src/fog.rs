@@ -31,6 +31,21 @@ impl Default for Table {
 }
 
 impl Table {
+    /// every entry, for a saved state.
+    pub(crate) fn saved(&self) -> Vec<[f32; 2]> {
+        self.entries.to_vec()
+    }
+
+    /// the entries a saved state had, false when they do not fit.
+    pub(crate) fn restore(&mut self, entries: &[[f32; 2]]) -> bool {
+        if entries.len() != ENTRIES {
+            return false;
+        }
+        self.entries.copy_from_slice(entries);
+        self.generation += 1;
+        true
+    }
+
     /// takes a write to the table data registers, into the entry the index
     /// register names, which then moves on to the next.
     pub fn write(&mut self, registers: &mut [u32], value: u32) {

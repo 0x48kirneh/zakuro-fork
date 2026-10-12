@@ -20,7 +20,7 @@ const TOTAL_TASKS: u32 = 0x35;
 const TASK_ID_LIST: u32 = 0x36;
 const TASK_ID_SIZE: usize = 8;
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct BossState {
     /// whether the player turned the title's SpotPass off.
     optout: u32,

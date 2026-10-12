@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 zakuro-common.workspace = true
 log.workspace = true
+serde.workspace = true

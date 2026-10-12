@@ -15,6 +15,7 @@ pub mod raster;
 pub mod registers;
 pub mod renderer;
 pub mod shader;
+pub mod state;
 pub mod tev;
 pub mod texture;
 
@@ -63,7 +64,7 @@ pub trait GpuMemory {
 }
 
 /// what one LCD controller holds.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct FramebufferConfig {
     pub address_a_left: u32,
     pub address_a_right: u32,

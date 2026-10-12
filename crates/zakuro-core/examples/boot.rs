@@ -146,7 +146,52 @@ fn main() {
         let mut parts = spec.splitn(3, ':');
         Some((parts.next()?.parse().ok()?, parts.next()?.to_owned(), parts.next().map(str::to_owned)))
     });
-    for frame in 0..frames {
+    // ZAKURO_SAVE_AT=frame:file saves the state at that frame, and
+    // ZAKURO_LOAD=file goes on from a saved state, at its frame
+    let save_at: Option<(u64, String)> = std::env::var("ZAKURO_SAVE_AT").ok().and_then(|spec| {
+        let (at, file) = spec.split_once(':')?;
+        Some((at.parse().ok()?, file.to_owned()))
+    });
+    let mut first = 0;
+    if let Some(file) = std::env::var_os("ZAKURO_LOAD") {
+        let started = std::time::Instant::now();
+        match std::fs::read(&file).map_err(|error| error.to_string()).and_then(|bytes| system.load_state(&bytes)) {
+            Ok(()) => {
+                first = system.frames;
+                println!("loaded the state at frame {first} in {:?}", started.elapsed());
+            }
+            Err(error) => {
+                eprintln!("could not load {}: {error}", file.to_string_lossy());
+                std::process::exit(1);
+            }
+        }
+    }
+    // ZAKURO_LOAD_AT=frame:file loads a saved state at that frame, once,
+    // and goes on from the state's frame
+    let mut load_at: Option<(u64, String)> = std::env::var("ZAKURO_LOAD_AT").ok().and_then(|spec| {
+        let (at, file) = spec.split_once(':')?;
+        Some((at.parse().ok()?, file.to_owned()))
+    });
+    let mut frame = first;
+    while frame < frames {
+        if let Some((_, file)) = load_at.take_if(|(at, _)| *at == frame) {
+            match std::fs::read(&file).map_err(|error| error.to_string()).and_then(|bytes| system.load_state(&bytes)) {
+                Ok(()) => {
+                    println!("frame {frame}: loaded the state, back at frame {}", system.frames);
+                    frame = system.frames;
+                }
+                Err(error) => println!("frame {frame}: could not load the state, {error}"),
+            }
+        }
+        if let Some((_, file)) = save_at.as_ref().filter(|(at, _)| *at == frame) {
+            let started = std::time::Instant::now();
+            match system.save_state().map_err(|error| error.to_string()).and_then(|bytes| {
+                std::fs::write(file, &bytes).map_err(|error| error.to_string()).map(|()| bytes.len())
+            }) {
+                Ok(length) => println!("frame {frame}: saved the state, {} KiB, in {:?}", length / 1024, started.elapsed()),
+                Err(error) => println!("frame {frame}: could not save the state, {error}"),
+            }
+        }
         if let Some((at, library, built)) = swap.as_ref().filter(|(at, ..)| *at == frame) {
             if let Some(built) = built {
                 std::fs::rename(built, library).expect("moving the new library into place");
@@ -278,6 +323,7 @@ fn main() {
         if outcome != FrameOutcome::Completed {
             break;
         }
+        frame += 1;
     }
 
     let elapsed = start.elapsed();
