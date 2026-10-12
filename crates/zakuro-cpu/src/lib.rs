@@ -269,8 +269,10 @@ impl Cpu {
         Exit::Timeout
     }
 
-    /// executes exactly one instruction.
-    #[inline]
+    /// executes exactly one instruction. always inlined, a call for every
+    /// instruction the interpreter runs costs it about a tenth, and the
+    /// compiler's choice flips with unrelated changes to its callers.
+    #[inline(always)]
     pub fn step<B: Bus>(&mut self, bus: &mut B) -> Option<Exit> {
         self.cycles += 1;
         if self.cpsr.thumb {
