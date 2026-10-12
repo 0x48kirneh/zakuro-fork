@@ -418,6 +418,15 @@ pub struct Settings {
     #[serde(deserialize_with = "or_default")]
     pub camera: CameraSource,
     pub camera_picture: Option<PathBuf>,
+    /// the name the player goes by in rooms, the console's own too.
+    pub nickname: String,
+    /// the number that tells this console apart over local wireless, made
+    /// once.
+    pub console_id: u64,
+    /// the room last joined, and the one opened, its name and port.
+    pub room_address: String,
+    pub room_name: String,
+    pub room_port: u16,
 }
 
 impl Default for Settings {
@@ -445,6 +454,11 @@ impl Default for Settings {
             enhancements: std::collections::BTreeMap::new(),
             camera: CameraSource::Webcam,
             camera_picture: None,
+            nickname: String::new(),
+            console_id: 0,
+            room_address: String::new(),
+            room_name: String::new(),
+            room_port: zakuro_core::room::DEFAULT_PORT,
         }
     }
 }

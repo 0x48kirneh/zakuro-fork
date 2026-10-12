@@ -11,6 +11,7 @@ pub mod loader;
 pub mod memory;
 pub mod mods;
 pub mod replay;
+pub mod room;
 pub mod recompiled;
 pub mod services;
 pub mod state;
@@ -73,6 +74,12 @@ pub struct Config {
     /// other refresh, see System::pace, when the host's GPU draws the 3D
     /// and shows the screens straight from its device.
     pub interpolate: bool,
+    /// the console owner's name, up to ten characters, which titles show
+    /// and local wireless tells others.
+    pub username: String,
+    /// the number that tells this console apart from others over local
+    /// wireless, the configuration's block 0x00090000.
+    pub console_id: u64,
 }
 
 impl Default for Config {
@@ -96,6 +103,8 @@ impl Default for Config {
             device: None,
             clock: None,
             interpolate: false,
+            username: "Zakuro".into(),
+            console_id: 0x5A4B_0000_0000_0001,
         }
     }
 }
@@ -161,6 +170,8 @@ pub struct System {
     pub cro: cro::CroManager,
     /// what the cameras see, from the frontend.
     pub camera: Option<Box<dyn camera::Camera>>,
+    /// the room local wireless goes through, none with wireless off.
+    pub room: Option<room::Link>,
     /// errors the title reported through err:f, newest last.
     pub fatal_errors: Vec<String>,
     /// undefined instructions we have seen, so the log stays readable.
@@ -250,6 +261,7 @@ impl System {
             pacing: Pacing::default(),
             cro: cro::CroManager::default(),
             camera: None,
+            room: None,
             fatal_errors: Vec::new(),
             undefined_seen: BTreeMap::new(),
             prefetch_aborts: BTreeMap::new(),
@@ -725,6 +737,7 @@ impl System {
         services::ir_rst::tick(self);
         services::ir::tick(self);
         services::cam::tick(self);
+        services::uds::tick(self);
     }
 
     /// the stereo samples the console played since the last call, at

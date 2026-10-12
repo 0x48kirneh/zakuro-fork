@@ -82,9 +82,16 @@ const STEREO_CAMERA_SETTINGS: [f32; 8] = [
 fn write_config_block(system: &mut System, block_id: u32, out: u32, size: u32) {
     let mut data = vec![0u8; size as usize];
     match block_id {
-        // user name, UTF-16, 0x1C bytes.
+        // the console's own number, which local wireless tells consoles
+        // apart by
+        0x0009_0000 => {
+            let id = system.config.console_id.to_le_bytes();
+            let length = data.len().min(id.len());
+            data[..length].copy_from_slice(&id[..length]);
+        }
+        // user name, UTF-16, 0x1C bytes, ten characters and the end.
         0x000A_0000 => {
-            let name: Vec<u16> = "Zakuro".encode_utf16().collect();
+            let name: Vec<u16> = system.config.username.encode_utf16().take(10).collect();
             for (i, unit) in name.iter().enumerate() {
                 if i * 2 + 1 < data.len() {
                     data[i * 2..i * 2 + 2].copy_from_slice(&unit.to_le_bytes());

@@ -18,6 +18,12 @@ fn main() {
     let config = Config {
         // ZAKURO_NEW3DS=1 runs the title on a New 3DS.
         new3ds: std::env::var("ZAKURO_NEW3DS").is_ok_and(|v| v == "1"),
+        // ZAKURO_NICK=name names the console, which tells it apart over
+        // local wireless too
+        username: std::env::var("ZAKURO_NICK").unwrap_or_else(|_| "Zakuro".into()),
+        console_id: std::env::var("ZAKURO_NICK").map_or(0x5A4B_0000_0000_0001, |nick| {
+            nick.bytes().fold(0xCBF2_9CE4_8422_2325u64, |hash, byte| (hash ^ byte as u64).wrapping_mul(0x0100_0000_01B3))
+        }),
         language: std::env::var("ZAKURO_LANGUAGE")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -75,6 +81,26 @@ fn main() {
     if std::env::var("ZAKURO_PROFILE").is_ok() {
         system.enable_profiler();
     }
+
+    // ZAKURO_ROOM_HOST=port opens a room and joins it, ZAKURO_ROOM=host:port
+    // joins one, under ZAKURO_NICK, for local wireless with another run
+    let _server = std::env::var("ZAKURO_ROOM_HOST").ok().and_then(|port| port.parse().ok()).map(|port| {
+        zakuro_core::room::Server::start(port, "boot", "", 8).unwrap_or_else(|error| {
+            eprintln!("could not open a room on port {port}: {error}");
+            std::process::exit(1);
+        })
+    });
+    let address = std::env::var("ZAKURO_ROOM").ok().or_else(|| _server.as_ref().map(|server| format!("127.0.0.1:{}", server.port())));
+    let _connection = address.map(|address| {
+        let nickname = std::env::var("ZAKURO_NICK").unwrap_or_else(|_| format!("boot{}", std::process::id()));
+        let connection = zakuro_core::room::Connection::join(&address, &nickname, "").unwrap_or_else(|error| {
+            eprintln!("could not join the room at {address}: {error}");
+            std::process::exit(1);
+        });
+        system.room = Some(connection.link());
+        println!("in the room at {address} as {nickname}");
+        connection
+    });
 
     // ZAKURO_CAMERA=picture.ppm is what the cameras see, a binary PPM,
     // whole, the way a QR code is shown to them.

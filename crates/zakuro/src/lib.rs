@@ -51,7 +51,16 @@ pub fn run(linked: Option<Linked>) {
             std::process::exit(2);
         }
     };
-    let settings = Settings::load();
+    let mut settings = Settings::load();
+    // the console's own number, made the first time and kept, which tells
+    // it apart from others over local wireless
+    if settings.console_id == 0 {
+        use std::hash::{BuildHasher, Hasher};
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |time| time.as_nanos()));
+        settings.console_id = hasher.finish() | 1;
+        settings.save();
+    }
 
     let data_dir = options.data.clone().map(PathBuf::from).or_else(default_data_dir);
     if let Some(dir) = &data_dir {
@@ -94,6 +103,8 @@ pub fn run(linked: Option<Linked>) {
         next_shown: Instant::now(),
         stop: false,
         camera: None,
+        room_server: None,
+        room: None,
         maximized_before_full_screen: false,
         resize_after_full_screen: false,
     };
@@ -376,6 +387,9 @@ struct App {
     /// what the running game's cameras were given to see, to give them
     /// another only when the settings change it.
     camera: Option<(CameraSource, Option<PathBuf>)>,
+    /// the room this program holds open, and the one it is in.
+    room_server: Option<zakuro_core::room::Server>,
+    room: Option<zakuro_core::room::Connection>,
     /// the window was maximized when it went full screen, which leaving
     /// full screen brings back.
     maximized_before_full_screen: bool,
@@ -549,6 +563,8 @@ impl App {
                 .collect(),
             resolution: self.settings.resolution,
             device: self.backend.as_ref().and_then(Backend::shared_device),
+            username: self.nickname(),
+            console_id: self.settings.console_id,
             ..Config::default()
         }
     }
@@ -631,9 +647,11 @@ impl App {
             ));
         }
         self.game = Some(game);
-        // the new game's cameras see what the settings say
+        // the new game's cameras see what the settings say, and it plays
+        // in the room the player is in
         self.camera = None;
         self.apply_camera();
+        self.link_room();
         self.menus.menu_open = false;
         self.keyboard.release();
         self.paused = false;
@@ -643,6 +661,9 @@ impl App {
 
     fn back_to_library(&mut self) {
         self.game = None;
+        if let Some(room) = &self.room {
+            room.playing("");
+        }
         if let Some(audio) = &self.audio {
             audio.clear();
         }
@@ -973,6 +994,12 @@ impl App {
             }
             Action::SaveState => self.save_state(),
             Action::LoadState => self.load_state(),
+            Action::HostRoom => self.host_room(),
+            Action::JoinRoom => {
+                let address = self.settings.room_address.clone();
+                self.join_room(&address);
+            }
+            Action::LeaveRoom => self.leave_room(),
             Action::ChooseCameraPicture => {
                 let picked = rfd::FileDialog::new()
                     .set_title("A picture for the cameras")
@@ -1089,6 +1116,11 @@ impl App {
         self.library.poll();
         self.poll_jobs();
         self.poll_gamepads();
+        // a room that went away takes the game's local wireless with it
+        if self.room.as_ref().is_some_and(|room| !room.open()) {
+            self.leave_room();
+            self.menus.message = Some("The room closed, or the connection to it was lost.".into());
+        }
 
         // a game waiting on its keyboard waits for the user, not running
         let typing = self.game.as_ref().is_some_and(|game| game.system.keyboard_request().is_some());
@@ -1220,6 +1252,65 @@ impl App {
         }
     }
 
+    /// the name the player goes by, the console's too.
+    fn nickname(&self) -> String {
+        match self.settings.nickname.trim() {
+            "" => "Player".into(),
+            name => name.chars().take(10).collect(),
+        }
+    }
+
+    /// gives the running game the room the player is in, and tells the room
+    /// the game.
+    fn link_room(&mut self) {
+        let Some(game) = &mut self.game else { return };
+        game.system.room = self.room.as_ref().map(|room| room.link());
+        if let Some(room) = &self.room {
+            room.playing(&game.name);
+        }
+    }
+
+    /// opens a room on the port chosen, and joins it.
+    fn host_room(&mut self) {
+        let name = match self.settings.room_name.trim() {
+            "" => format!("{}'s room", self.nickname()),
+            name => name.to_owned(),
+        };
+        let password = self.menus.room_password.clone();
+        match zakuro_core::room::Server::start(self.settings.room_port, &name, &password, 16) {
+            Ok(server) => {
+                let address = format!("127.0.0.1:{}", server.port());
+                self.room_server = Some(server);
+                self.join_room(&address);
+                if self.room.is_none() {
+                    self.room_server = None;
+                }
+            }
+            Err(error) => self.menus.message = Some(format!("The room could not be opened on port {}, {error}", self.settings.room_port)),
+        }
+    }
+
+    /// joins the room at address.
+    fn join_room(&mut self, address: &str) {
+        let password = self.menus.room_password.clone();
+        match zakuro_core::room::Connection::join(address.trim(), &self.nickname(), &password) {
+            Ok(room) => {
+                self.room = Some(room);
+                self.link_room();
+            }
+            Err(error) => self.menus.message = Some(format!("Could not join the room, {error}.")),
+        }
+    }
+
+    /// leaves the room, and closes it when it is this program's.
+    fn leave_room(&mut self) {
+        self.room = None;
+        self.room_server = None;
+        if let Some(game) = &mut self.game {
+            game.system.room = None;
+        }
+    }
+
     /// the file of a slot of the running game's saved states.
     fn state_path(&self, slot: u8) -> Option<PathBuf> {
         let program_id = self.game.as_ref()?.system.title.as_ref()?.program_id();
@@ -1305,6 +1396,11 @@ impl App {
         let game = self.game.as_ref().map(|game| (game.name.clone(), game.fps, game.system.recompiled.is_some()));
         let fast = self.fast_forwarding;
         let keyboard = self.game.as_ref().and_then(|game| game.system.keyboard_request().cloned());
+        let room = self.room.as_ref().filter(|_| self.menus.multiplayer_open).map(|connection| menus::RoomView {
+            name: connection.room().to_owned(),
+            members: connection.members().into_iter().map(|member| (member.nickname, member.game)).collect(),
+            port: self.room_server.as_ref().map(|server| server.port()),
+        });
         let cheats = self.game.as_ref().filter(|_| self.menus.cheats_open).map(|game| {
             game.system.cheats.iter().map(|cheat| (cheat.name.clone(), cheat.enabled, cheat.notes.join("\n"), cheat.builtin)).collect::<Vec<_>>()
         });
@@ -1318,6 +1414,9 @@ impl App {
                 None => actions.extend(menus.library(ui, library, settings, jobs)),
             }
             actions.extend(menus.settings(ui.ctx(), settings));
+            if menus.multiplayer_open {
+                actions.extend(menus.multiplayer(ui.ctx(), settings, room.as_ref()));
+            }
             if let Some(cheats) = &cheats {
                 actions.extend(menus.cheats(ui.ctx(), cheats));
             }

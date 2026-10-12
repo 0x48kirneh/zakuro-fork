@@ -32,6 +32,10 @@ pub enum Action {
     /// save the game's state to the slot chosen, or load it from there.
     SaveState,
     LoadState,
+    /// open a room and join it, join another's, or leave the one joined.
+    HostRoom,
+    JoinRoom,
+    LeaveRoom,
     Rescan,
     Resume,
     Reset,
@@ -75,6 +79,9 @@ pub struct Menus {
     pub toast: Option<(String, std::time::Instant)>,
     /// the slot states are saved to and loaded from, 1 to 9.
     pub slot: u8,
+    /// the multiplayer window, and the password typed in it.
+    pub multiplayer_open: bool,
+    pub room_password: String,
     /// a report on the game, to copy from the message it goes with, and
     /// from no other.
     pub report: Option<(String, String)>,
@@ -85,6 +92,15 @@ pub struct Menus {
     pub compiler_offer: Option<usize>,
     icons: HashMap<PathBuf, egui::TextureHandle>,
     background: Background,
+}
+
+/// the room the player is in, as the multiplayer window shows it.
+pub struct RoomView {
+    pub name: String,
+    /// each member's nickname and the game they play.
+    pub members: Vec<(String, String)>,
+    /// the port of the room this program holds open, when it is its own.
+    pub port: Option<u16>,
 }
 
 /// the picture behind the library, decoded away from the interface.
@@ -175,6 +191,9 @@ impl Menus {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.button("Settings").clicked() {
                         self.settings_open = true;
+                    }
+                    if ui.button("Multiplayer").clicked() {
+                        self.multiplayer_open = true;
                     }
                     if ui.add_enabled(settings.games.is_some(), egui::Button::new("Refresh")).clicked() {
                         actions.push(Action::Rescan);
@@ -401,6 +420,9 @@ impl Menus {
                 if wide(ui, "Cheats") {
                     self.cheats_open = true;
                 }
+                if wide(ui, "Multiplayer") {
+                    self.multiplayer_open = true;
+                }
                 if ui
                     .add_sized([200.0, 28.0], egui::Button::new("Show the camera a picture"))
                     .on_hover_text("Pick a picture for the console's cameras to see, a QR code's say, in place of the computer's camera.")
@@ -478,6 +500,80 @@ impl Menus {
             });
         });
         self.cheats_open = open;
+        actions
+    }
+
+    /// the multiplayer window, when open: the room the player is in, or
+    /// joining one and opening one.
+    pub fn multiplayer(&mut self, ctx: &egui::Context, settings: &mut Settings, room: Option<&RoomView>) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let before = settings.clone();
+        let mut open = self.multiplayer_open;
+        egui::Window::new("Multiplayer").open(&mut open).default_width(380.0).show(ctx, |ui| {
+            ui.label(
+                RichText::new("Local wireless play with others goes through a room, which one of you opens and the others join over the network.")
+                    .weak(),
+            );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Nickname");
+                ui.add(egui::TextEdit::singleline(&mut settings.nickname).char_limit(10).hint_text("Player"))
+                    .on_hover_text("The name others see, and the console's own, which games show. It changes with the next game started.");
+            });
+            ui.separator();
+            match room {
+                Some(room) => {
+                    ui.label(RichText::new(format!("In the room {}", room.name)).strong());
+                    if let Some(port) = room.port {
+                        ui.label(format!("Open on port {port}. Others join with this computer's address and that port. Over the internet the router has to let that port through."));
+                    }
+                    ui.add_space(4.0);
+                    for (nickname, game) in &room.members {
+                        match game.is_empty() {
+                            true => ui.label(nickname),
+                            false => ui.label(format!("{nickname}, playing {game}")),
+                        };
+                    }
+                    ui.add_space(4.0);
+                    let leave = if room.port.is_some() { "Close the room" } else { "Leave the room" };
+                    if ui.button(leave).clicked() {
+                        actions.push(Action::LeaveRoom);
+                    }
+                }
+                None => {
+                    ui.label(RichText::new("Join a room").strong());
+                    ui.horizontal(|ui| {
+                        ui.label("Address");
+                        ui.add(egui::TextEdit::singleline(&mut settings.room_address).hint_text("192.168.0.10:24873"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Password");
+                        ui.add(egui::TextEdit::singleline(&mut self.room_password).password(true).hint_text("none"));
+                    });
+                    if ui.add_enabled(!settings.room_address.trim().is_empty(), egui::Button::new("Join")).clicked() {
+                        actions.push(Action::JoinRoom);
+                    }
+                    ui.separator();
+                    ui.label(RichText::new("Open a room").strong());
+                    ui.horizontal(|ui| {
+                        ui.label("Name");
+                        ui.add(egui::TextEdit::singleline(&mut settings.room_name).hint_text("Zakuro"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Port");
+                        ui.add(egui::DragValue::new(&mut settings.room_port).range(1024..=65535));
+                    });
+                    ui.label(RichText::new("The password above, when there is one, is the room's.").weak());
+                    if ui.button("Open").clicked() {
+                        actions.push(Action::HostRoom);
+                    }
+                }
+            }
+        });
+        self.multiplayer_open = open;
+        if *settings != before {
+            actions.push(Action::Settings);
+        }
         actions
     }
 
