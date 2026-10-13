@@ -52,6 +52,7 @@ fn main() {
         // ZAKURO_INTERPOLATE=1 draws the pictures in between, which takes
         // ZAKURO_PRESENT=direct, and saves them with the screens
         interpolate: std::env::var("ZAKURO_INTERPOLATE").is_ok_and(|v| v == "1"),
+        skip_idle_loops: std::env::var("ZAKURO_IDLE").map_or(true, |v| v != "0"),
         device: std::env::var("ZAKURO_PRESENT").is_ok_and(|v| v == "direct").then(|| {
             let device = zakuro_gpu::SharedDevice::new().unwrap_or_else(|error| {
                 eprintln!("no device to show the screens from: {error}");
@@ -388,6 +389,9 @@ fn main() {
         println!("in between:    {betweens} of {executed} refreshes");
     }
     println!("instructions:  {}", system.cpu.cycles);
+    if system.idle.skipped > 0 {
+        println!("idle skipped:  {} cycles of loops that changed nothing", system.idle.skipped);
+    }
     println!(
         "speed:         {:.2} MIPS",
         system.cpu.cycles as f64 / elapsed.as_secs_f64() / 1_000_000.0

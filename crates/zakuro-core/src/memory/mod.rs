@@ -3,7 +3,7 @@
 pub mod config;
 pub mod physical;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use zakuro_common::memory_map::*;
 use zakuro_common::VAddr;
@@ -94,7 +94,22 @@ pub struct Memory {
     /// accesses to unmapped addresses, deduplicated so one bad loop does not
     /// produce a gigabyte of log.
     faults: BTreeMap<VAddr, u32>,
+
+    /// while a loop is watched for changing nothing, what each byte the CPU
+    /// wrote held before its first write, see crate::idle.
+    write_log: Option<Box<WriteLog>>,
 }
+
+/// what the CPU's writes wrote over, byte by byte.
+#[derive(Default)]
+struct WriteLog {
+    old: HashMap<VAddr, u8>,
+    /// it wrote more than is kept, too much for a loop that polls.
+    overflowed: bool,
+}
+
+/// the most bytes a write log keeps.
+const MOST_LOGGED: usize = 1024;
 
 /// what writes back the host GPU's drawing over a range, for a read or a
 /// write of the CPU waiting on it. the system sets it to its GPU while the
@@ -196,6 +211,48 @@ impl Memory {
             gpu_sync: None,
             mappings: BTreeMap::new(),
             faults: BTreeMap::new(),
+            write_log: None,
+        }
+    }
+
+    /// starts noting what the CPU's writes write over, forgetting what was
+    /// noted before.
+    pub(crate) fn log_writes(&mut self) {
+        self.write_log = Some(Box::default());
+    }
+
+    pub(crate) fn stop_logging_writes(&mut self) {
+        self.write_log = None;
+    }
+
+    /// whether every byte the CPU wrote since log_writes holds again what it
+    /// held before, but those in skip.
+    pub(crate) fn writes_undone(&mut self, skip: std::ops::Range<VAddr>) -> bool {
+        let Some(log) = self.write_log.take() else { return false };
+        let undone = !log.overflowed
+            && log.old.iter().all(|(&addr, &old)| {
+                let mut now = [0u8];
+                skip.contains(&addr) || {
+                    self.read_bytes(addr, &mut now);
+                    now[0] == old
+                }
+            });
+        self.write_log = Some(log);
+        undone
+    }
+
+    /// notes what a write of the CPU is about to write over.
+    #[cold]
+    fn note_write(&mut self, addr: VAddr, len: usize) {
+        let mut old = [0u8; 4];
+        self.read_bytes(addr, &mut old[..len]);
+        let Some(log) = &mut self.write_log else { return };
+        for (offset, byte) in old[..len].iter().enumerate() {
+            if log.old.len() >= MOST_LOGGED {
+                log.overflowed = true;
+                return;
+            }
+            log.old.entry(addr.wrapping_add(offset as u32)).or_insert(*byte);
         }
     }
 
@@ -759,6 +816,9 @@ impl Bus for Memory {
 
     #[inline(always)]
     fn write8(&mut self, addr: u32, value: u8) {
+        if self.write_log.is_some() {
+            self.note_write(addr, 1);
+        }
         match self.cpu_page_write(addr, 1) {
             Some(page) => page[(addr & PAGE_MASK) as usize] = value,
             None => self.note_fault(addr),
@@ -767,6 +827,9 @@ impl Bus for Memory {
 
     #[inline(always)]
     fn write16(&mut self, addr: u32, value: u16) {
+        if self.write_log.is_some() {
+            self.note_write(addr, 2);
+        }
         let offset = (addr & PAGE_MASK) as usize;
         if offset <= PAGE_SIZE as usize - 2 {
             match self.cpu_page_write(addr, 2) {
@@ -781,6 +844,9 @@ impl Bus for Memory {
 
     #[inline(always)]
     fn write32(&mut self, addr: u32, value: u32) {
+        if self.write_log.is_some() {
+            self.note_write(addr, 4);
+        }
         let offset = (addr & PAGE_MASK) as usize;
         if offset <= PAGE_SIZE as usize - 4 {
             match self.cpu_page_write(addr, 4) {

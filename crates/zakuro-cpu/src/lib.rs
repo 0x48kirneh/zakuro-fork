@@ -87,6 +87,21 @@ impl Default for Cpu {
     }
 }
 
+/// what running code can see of the core: every register in every bank,
+/// the flags, VFP and the exclusive monitor, without the cycle count, to
+/// tell whether running some code left it as it was.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    regs: [u32; 16],
+    psrs: [Psr; 8],
+    banked: [[u32; 2]; 6],
+    fiq_user: [[u32; 5]; 2],
+    vfp: [u32; 34],
+    cp15: [u32; 4],
+    exclusive_addr: Option<u32>,
+    halted: bool,
+}
+
 impl Cpu {
     pub fn new() -> Cpu {
         Cpu {
@@ -103,6 +118,25 @@ impl Cpu {
             branched: false,
             halted: false,
             cycles: 0,
+        }
+    }
+
+    /// the core as running code sees it, see Snapshot.
+    pub fn snapshot(&self) -> Snapshot {
+        let [b0, b1, b2, b3, b4, b5] = self.banked_spsr;
+        let mut vfp = [0u32; 34];
+        vfp[..32].copy_from_slice(&self.vfp.regs);
+        vfp[32] = self.vfp.fpscr;
+        vfp[33] = self.vfp.fpexc;
+        Snapshot {
+            regs: self.regs,
+            psrs: [self.cpsr, self.spsr, b0, b1, b2, b3, b4, b5],
+            banked: self.banked_sp_lr,
+            fiq_user: [self.fiq_r8_r12, self.user_r8_r12],
+            vfp,
+            cp15: [self.cp15.thread_id_rw, self.cp15.thread_id_ro, self.cp15.thread_id_priv, self.cp15.control],
+            exclusive_addr: self.exclusive_addr,
+            halted: self.halted,
         }
     }
 

@@ -7,6 +7,7 @@ pub mod enhancements;
 pub mod cro;
 pub mod download_play;
 pub mod hints;
+pub mod idle;
 pub mod kernel;
 pub mod loader;
 pub mod memory;
@@ -87,6 +88,9 @@ pub struct Config {
     /// what a Download Play child runs with, the host's address and the
     /// passphrase of its network, APT:GetWirelessRebootInfo's answer.
     pub wireless_reboot: Option<[u8; 16]>,
+    /// the interpreter skips to the next event past loops that change
+    /// nothing, see idle.
+    pub skip_idle_loops: bool,
 }
 
 impl Default for Config {
@@ -114,6 +118,7 @@ impl Default for Config {
             console_id: 0x5A4B_0000_0000_0001,
             dlp_child: None,
             wireless_reboot: None,
+            skip_idle_loops: true,
         }
     }
 }
@@ -206,6 +211,9 @@ pub struct System {
     /// steps since the profiler last looked.
     profile_skip: u32,
 
+    /// loops that change nothing, which the interpreter skips past.
+    pub idle: idle::IdleLoops,
+
     /// code recompiled ahead of time, which runs instead of the interpreter
     /// wherever it has something.
     pub recompiled: Option<recompiled::Library>,
@@ -246,6 +254,7 @@ pub enum StepOutcome {
 impl System {
     pub fn new(config: Config) -> System {
         let boot_clock = config.clock.unwrap_or_else(memory::config::host_clock);
+        let idle = idle::IdleLoops::new(config.skip_idle_loops);
         let app_bytes = 64 * 1024 * 1024;
         let mut services = ServiceState::default();
         if let Some(dir) = &config.data_dir {
@@ -285,6 +294,7 @@ impl System {
             next_preempt: PREEMPT_INTERVAL,
             profile: None,
             profile_skip: 0,
+            idle,
             recompiled: None,
             hints: None,
             interpreted_instructions: 0,
@@ -329,6 +339,7 @@ impl System {
         // HID samples its inputs on its own, whether or not anyone pressed
         // anything
         let input = self.services.hid.input;
+        self.idle_interrupted(false);
         services::hid::update(self, input);
         cheats::run(self);
         // run up to the boundary step() would end the frame at, and end it
@@ -371,7 +382,9 @@ impl System {
         if self.kernel.reschedule_pending || self.kernel.current_thread.is_none() {
             self.kernel.reschedule_pending = false;
             let tick = self.cpu.cycles;
-            self.kernel.schedule(&mut self.cpu, tick);
+            if self.kernel.schedule(&mut self.cpu, tick) {
+                self.idle_interrupted(true);
+            }
             // a thread released here that keeps the core gets its result
             // too, before it runs on, not over whatever it does next
             self.apply_wait_result();
@@ -451,12 +464,21 @@ impl System {
 
         let exit = match self.run_recompiled(deadline) {
             Some(exit) => {
+                // its writes do not go through the log a watch keeps
+                self.idle_interrupted(false);
                 if let Some(hints) = &mut self.hints {
                     hints.library_ran();
                 }
                 exit
             }
             None => {
+                // a thread polling in a loop that changes nothing waits for
+                // the next event, as it would on a console spinning freely
+                if let Some(until) = self.idle.due(self.cpu.cycles).then(|| self.idle_until(deadline)).flatten() {
+                    self.cpu.cycles = until;
+                    self.kernel.reschedule_pending = true;
+                    return StepOutcome::Ran;
+                }
                 self.interpreted_instructions += 1;
                 let thumb = self.cpu.cpsr.thumb;
                 if let (Some(hints), Some(library)) = (&mut self.hints, &self.recompiled) {
@@ -474,6 +496,9 @@ impl System {
                 exit
             }
         };
+        if exit.is_some() {
+            self.idle_interrupted(true);
+        }
         match exit {
             None => {}
             Some(Exit::Supervisor(number)) => kernel::svc::dispatch(self, number),
@@ -669,6 +694,7 @@ impl System {
 
     /// everything that happens between frames, vertical blank, input, clock.
     fn end_frame(&mut self) {
+        self.idle_interrupted(false);
         self.frames += 1;
         if self.frames.is_multiple_of(hints::SAVE_EVERY) {
             if let Some(hints) = &mut self.hints {
@@ -760,6 +786,7 @@ impl System {
     /// the DSP finishing an audio frame, it plays its voices one frame on and
     /// interrupts the title, whose sound library does one update per interrupt.
     fn audio_frame(&mut self) {
+        self.idle_interrupted(false);
         // the whole opening froze until this ran every 4.9 ms. goddamn audio timing
         if self.services.dsp.running {
             services::dsp::advance(self);
@@ -1294,15 +1321,94 @@ mod tests {
     /// one thread at the entry create_thread gives, its code a branch to
     /// itself, current and running.
     fn one_spinning_thread(system: &mut System) -> ThreadId {
+        one_thread_running(system, &[0xEAFF_FFFE])
+    }
+
+    /// one thread running code at 0x00100000, current, with its stack and
+    /// r0 in the same page, the stack at 0x00100F00 and r0 at 0x00100800.
+    fn one_thread_running(system: &mut System, code: &[u32]) -> ThreadId {
         use memory::{MemoryState, Permission};
         let block = system.memory.phys.allocate(memory::MemoryRegion::Application, 0x1000).unwrap();
         system.memory.map(0x0010_0000, block.addr, 0x1000, Permission::RW | Permission::EXECUTE, MemoryState::Code);
-        system.memory.write32(0x0010_0000, 0xEAFF_FFFE);
-        let id = system.kernel.create_thread("main", 0x0010_0000, 0x1000_0000, 0, 0x30, 0);
+        for (index, word) in code.iter().enumerate() {
+            system.memory.write32(0x0010_0000 + index as u32 * 4, *word);
+        }
+        let id = system.kernel.create_thread("main", 0x0010_0000, 0x0010_0F00, 0, 0x30, 0);
         system.map_tls_page(id);
         system.kernel.schedule(&mut system.cpu, 0);
         assert_eq!(system.kernel.current_thread, Some(id));
+        system.cpu.regs[0] = 0x0010_0800;
         id
+    }
+
+    /// runs steps until the run gets to tick or steps runs out, how many it
+    /// took.
+    fn steps_to(system: &mut System, tick: u64, steps: usize) -> usize {
+        (0..steps).take_while(|_| {
+            system.step(None);
+            system.cpu.cycles < tick
+        }).count() + 1
+    }
+
+    /// a thread alone on the core spinning on nothing waits for the next
+    /// event, the next audio frame here, instead of the interpreter running
+    /// every turn of its loop until then.
+    #[test]
+    fn a_thread_spinning_alone_skips_to_the_next_event() {
+        let mut system = System::new(Config::default());
+        one_spinning_thread(&mut system);
+        let audio = system.next_audio_frame;
+        assert!(steps_to(&mut system, audio, 40_000) < 20_000, "skipped");
+        assert_eq!(system.cpu.cycles, audio, "to the audio frame, not past it");
+        assert!(system.idle.skipped > 0);
+    }
+
+    /// a loop that counts in memory changes something every turn, and runs
+    /// every one of them.
+    #[test]
+    fn a_loop_that_counts_is_not_skipped() {
+        let mut system = System::new(Config::default());
+        // ldr r1, [r0]; add r1, r1, #1; str r1, [r0]; b back
+        one_thread_running(&mut system, &[0xE590_1000, 0xE281_1001, 0xE580_1000, 0xEAFF_FFFB]);
+        for _ in 0..40_000 {
+            system.step(None);
+        }
+        assert_eq!(system.idle.skipped, 0);
+        assert_eq!(system.memory.read32(0x0010_0800), 10_000, "every turn counted");
+    }
+
+    /// a loop that puts back what it wrote, the way taking and letting go of
+    /// a lock does, and pushes and pops, changes nothing and is skipped.
+    #[test]
+    fn a_loop_that_puts_back_what_it_wrote_is_skipped() {
+        let mut system = System::new(Config::default());
+        // ldr r1, [r0]; add r1, r1, #1; str r1, [r0]; sub r1, r1, #1;
+        // str r1, [r0]; push {r4, lr}; pop {r4, lr}; b back
+        let code = [0xE590_1000, 0xE281_1001, 0xE580_1000, 0xE241_1001, 0xE580_1000, 0xE92D_4010, 0xE8BD_4010, 0xEAFF_FFF7];
+        one_thread_running(&mut system, &code);
+        system.memory.write32(0x0010_0800, 7);
+        let audio = system.next_audio_frame;
+        assert!(steps_to(&mut system, audio, 40_000) < 20_000, "skipped");
+        assert_eq!(system.memory.read32(0x0010_0800), 7);
+    }
+
+    /// a skip stops at the wake of a thread sleeping, which gets the core
+    /// then.
+    #[test]
+    fn a_skip_stops_where_a_sleeping_thread_wakes() {
+        let mut system = System::new(Config::default());
+        one_spinning_thread(&mut system);
+        let sleeper = system.kernel.create_thread("sleeper", 0x0010_0000, 0x0010_0E00, 0, 0x20, 0);
+        system.map_tls_page(sleeper);
+        let thread = system.kernel.thread_mut(sleeper);
+        thread.status = ThreadStatus::Sleeping;
+        thread.wakeup_at = Some(20_000);
+        let steps = (0..40_000).take_while(|_| {
+            system.step(None);
+            system.kernel.current_thread != Some(sleeper)
+        });
+        assert!(steps.count() < 20_000, "skipped");
+        assert!((20_000..20_008).contains(&system.cpu.cycles), "woke at {}", system.cpu.cycles);
     }
 
     /// waits on a handle for good, as svcWaitSynchronization1.
