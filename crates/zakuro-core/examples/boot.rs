@@ -478,6 +478,14 @@ fn main() {
         }
     }
 
+    let threads = system.profiled_threads();
+    if !threads.is_empty() {
+        let total: u64 = threads.iter().map(|(_, hits)| hits).sum();
+        println!("profiled threads:");
+        for (thread, hits) in threads {
+            println!("  {thread:<8} {:5.1}%", hits as f64 * 100.0 / total as f64);
+        }
+    }
     let hot = system.hot_spots(std::env::var("ZAKURO_HOT").ok().and_then(|v| v.parse().ok()).unwrap_or(15));
     if !hot.is_empty() {
         println!("hot spots:");

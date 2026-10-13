@@ -202,7 +202,9 @@ pub struct System {
     next_preempt: u64,
 
     /// sampling profiler, counts how often each thread was found at each PC.
-    pub profile: Option<BTreeMap<(String, u32), u64>>,
+    pub profile: Option<BTreeMap<(ThreadId, u32), u64>>,
+    /// steps since the profiler last looked.
+    profile_skip: u32,
 
     /// code recompiled ahead of time, which runs instead of the interpreter
     /// wherever it has something.
@@ -282,6 +284,7 @@ impl System {
             next_audio_frame: CYCLES_PER_AUDIO_FRAME,
             next_preempt: PREEMPT_INTERVAL,
             profile: None,
+            profile_skip: 0,
             recompiled: None,
             hints: None,
             interpreted_instructions: 0,
@@ -592,23 +595,44 @@ impl System {
         let Some(profile) = &self.profile else {
             return Vec::new();
         };
-        let mut entries: Vec<(String, u32, u64)> = profile
-            .iter()
-            .map(|((thread, pc), hits)| (thread.clone(), *pc, *hits))
-            .collect();
+        let mut entries: Vec<(String, u32, u64)> =
+            profile.iter().map(|(&(thread, pc), &hits)| (self.thread_name(thread), pc, hits)).collect();
         entries.sort_by_key(|&(_, _, hits)| std::cmp::Reverse(hits));
         entries.truncate(count);
         entries
     }
 
+    /// how many samples found each thread running, most first.
+    pub fn profiled_threads(&self) -> Vec<(String, u64)> {
+        let Some(profile) = &self.profile else {
+            return Vec::new();
+        };
+        let mut threads: BTreeMap<ThreadId, u64> = BTreeMap::new();
+        for (&(thread, _), &hits) in profile {
+            *threads.entry(thread).or_insert(0) += hits;
+        }
+        let mut threads: Vec<(String, u64)> = threads.into_iter().map(|(thread, hits)| (self.thread_name(thread), hits)).collect();
+        threads.sort_by_key(|&(_, hits)| std::cmp::Reverse(hits));
+        threads
+    }
+
+    fn thread_name(&self, id: ThreadId) -> String {
+        self.kernel.threads.get(id as usize).map_or_else(|| format!("thread {id}"), |thread| thread.name.clone())
+    }
+
     fn sample(&mut self) {
+        // one step in so many, a prime so it does not beat in step with a
+        // loop, keeps a profile from slowing the run down
+        self.profile_skip = self.profile_skip.wrapping_add(1);
+        if !self.profile_skip.is_multiple_of(61) {
+            return;
+        }
         let Some(id) = self.kernel.current_thread else {
             return;
         };
-        let name = self.kernel.thread(id).name.clone();
         let pc = self.cpu.regs[15];
         if let Some(profile) = &mut self.profile {
-            *profile.entry((name, pc)).or_insert(0) += 1;
+            *profile.entry((id, pc)).or_insert(0) += 1;
         }
     }
 
