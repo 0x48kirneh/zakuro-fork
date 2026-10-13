@@ -70,7 +70,8 @@ mod layout {
 pub struct DspState {
     pub component_loaded: bool,
     pub running: bool,
-    pub semaphore_event: Option<u32>,
+    /// the event the firmware signals, which the service keeps however many
+    /// handles to it the title opens and closes.
     pub semaphore_event_object: Option<ObjectId>,
     /// events registered for the three DSP interrupts.
     pub interrupt_events: Vec<ObjectId>,
@@ -259,19 +260,22 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, id, &[]);
             true
         }
-        // GetSemaphoreEventHandle -> the event the audio thread waits on.
+        // GetSemaphoreEventHandle -> the event the audio thread waits on, in
+        // a handle of the title's own each time, as a handle copied over is.
+        // a title that closed its handle when it let the DSP go asks again
+        // after loading it anew, and the old number is gone by then
         GET_SEMAPHORE_EVENT_HANDLE => {
-            let handle = match system.services.dsp.semaphore_event {
-                Some(handle) => handle,
+            let handle = match system.services.dsp.semaphore_event_object {
+                Some(object) => system.kernel.handles.duplicate_object(&mut system.kernel.objects, object, "DSP:semaphore"),
                 None => {
                     let (object, handle) =
                         system.kernel.create_event(ResetType::OneShot, "DSP:semaphore");
                     system.kernel.objects.add_ref(object);
-                    system.services.dsp.semaphore_event = Some(handle);
                     system.services.dsp.semaphore_event_object = Some(object);
                     handle
                 }
             };
+            log::debug!("dsp: the semaphore event in handle 0x{handle:X}");
             buffer.set(&mut system.memory, 0, Header::new(id, 1, 2).0);
             buffer.set(&mut system.memory, 1, 0);
             buffer.set(&mut system.memory, 2, Descriptor::handles(1));
@@ -413,5 +417,26 @@ mod tests {
         signal_semaphore(&mut system);
 
         assert_eq!(system.services.dsp.semaphore_value, 0x2FFF);
+    }
+
+    fn semaphore_handle(system: &mut System, buffer: &CommandBuffer) -> u32 {
+        buffer.set(&mut system.memory, 0, Header::new(GET_SEMAPHORE_EVENT_HANDLE, 0, 0).0);
+        crate::services::handle_request(system, crate::services::Target::service("dsp::DSP".into(), 0));
+        assert_eq!(buffer.get(&mut system.memory, 1), 0);
+        buffer.get(&mut system.memory, 3)
+    }
+
+    /// a title that closed its semaphore handle when it let the DSP go, and
+    /// asks for it again once it loaded the DSP anew, gets a handle of its
+    /// own to the same event, not the number it closed.
+    #[test]
+    fn a_closed_semaphore_handle_is_not_given_back() {
+        let (mut system, buffer) = crate::services::tests::system_with_thread();
+        let first = semaphore_handle(&mut system, &buffer);
+        assert!(system.kernel.handles.close(&mut system.kernel.objects, first));
+        let second = semaphore_handle(&mut system, &buffer);
+        assert_ne!(second, first, "a handle of its own");
+        let object = system.kernel.resolve(second).expect("the handle names the event");
+        assert_eq!(Some(object), system.services.dsp.semaphore_event_object, "the same event");
     }
 }
