@@ -453,10 +453,18 @@ fn sleep_thread(system: &mut System) {
         nanos_to_ticks(nanos)
     } else if system.kernel.others_ready() {
         YIELD_TICKS
+    } else if system.kernel.next_event().is_some_and(|at| at <= tick) {
+        // a thread or a timer is due, and the pass at the yield wakes it on
+        // time
+        0
     } else {
         // nobody else can take the core, so a zero yield is a no-op: the
         // thread keeps it, and no scheduling pass is due. titles that poll
         // this way in a tight loop were paying a full pass per iteration.
+        // it still let the core go, as the pass would have counted it
+        if let Some(thread) = system.kernel.current_mut() {
+            thread.running_since = tick;
+        }
         system.cpu.regs[0] = 0;
         return;
     };

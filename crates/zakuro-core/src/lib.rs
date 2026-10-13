@@ -1352,6 +1352,25 @@ mod tests {
         assert!(system.kernel.reschedule_pending, "the ready thread gets a pass");
     }
 
+    /// a zero sleep while a thread is due to wake still has the pass then,
+    /// so that thread wakes on time, not at the next preemption.
+    #[test]
+    fn a_zero_sleep_wakes_a_thread_that_is_due() {
+        let mut system = System::new(Config::default());
+        let first = one_spinning_thread(&mut system);
+        let second = system.kernel.create_thread("second", 0x0010_0000, 0x0FF0_0000, 0, 0x30, 0);
+        system.map_tls_page(second);
+        let thread = system.kernel.thread_mut(second);
+        thread.status = ThreadStatus::Sleeping;
+        thread.wakeup_at = Some(system.cpu.cycles);
+        system.kernel.reschedule_pending = false;
+        system.cpu.regs[0] = 0;
+        system.cpu.regs[1] = 0;
+        kernel::svc::dispatch(&mut system, 0x0A);
+        assert_eq!(system.kernel.thread(first).status, ThreadStatus::Sleeping, "it steps aside for the pass");
+        assert!(system.kernel.reschedule_pending, "the sleeper due gets a pass");
+    }
+
     /// a timer fires at its tick, not at the next frame, and the thread on
     /// it wakes then. a pulse timer is gone once it woke a waiter, and comes
     /// again a period after it was due.
