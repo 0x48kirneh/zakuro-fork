@@ -213,7 +213,7 @@ impl System {
         self.recompiled_instructions = console.recompiled_instructions;
         // what was about to be shown, and the pace of the pictures in
         // between, start again
-        self.showing = [None, None];
+        self.showing = [None, None, None];
         self.pacing = Pacing::default();
         self.prefetch_aborts.clear();
         self.undefined_seen.clear();

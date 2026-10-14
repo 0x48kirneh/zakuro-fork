@@ -177,7 +177,7 @@ pub struct System {
     pub lcd_force_black: bool,
     /// the scaled picture each screen had at the last presentation, which
     /// goes up at the next, once the GPU had a frame's time to draw it.
-    showing: [Option<zakuro_gpu::ScreenRef>; 2],
+    showing: [Option<zakuro_gpu::ScreenRef>; 3],
     /// frame interpolation's count of the refreshes.
     pacing: Pacing,
     /// the dynamic module loader's state.
@@ -277,7 +277,7 @@ impl System {
             unimplemented_svcs: BTreeSet::new(),
             services_seen: BTreeSet::new(),
             lcd_force_black: false,
-            showing: [None, None],
+            showing: [None, None, None],
             pacing: Pacing::default(),
             cro: cro::CroManager::default(),
             camera: None,
@@ -741,7 +741,7 @@ impl System {
         let pacing = &mut self.pacing;
         pacing.refreshes += 1;
         pacing.between = false;
-        let top = self.screen_ref(zakuro_common::Screen::Top);
+        let top = self.screen_ref(zakuro_common::Screen::Top, false);
         let pacing = &mut self.pacing;
         if top.is_none() || top == pacing.last {
             if pacing.refreshes - pacing.new_at > 2 {
@@ -952,16 +952,42 @@ impl System {
     /// since, is the console's own grown to it, so the size stays the same
     /// from frame to frame.
     pub fn read_screen_scaled(&mut self, screen: zakuro_common::Screen) -> Screen {
+        self.read_scaled(screen, false)
+    }
+
+    /// the top screen's picture for the right eye, as read_screen_scaled
+    /// gives the left one's, when the title draws in 3D.
+    pub fn read_right_eye_scaled(&mut self) -> Option<Screen> {
+        self.draws_in_3d().then(|| self.read_scaled(zakuro_common::Screen::Top, true))
+    }
+
+    fn read_scaled(&mut self, screen: zakuro_common::Screen, right: bool) -> Screen {
         let (width, height) = (screen.width(), screen.height());
         let scale = self.gpu.scale();
-        if let Some(scaled) = self.scaled_screen(screen) {
+        if let Some(scaled) = self.scaled_screen(screen, right) {
             return scaled;
         }
-        let native = self.read_screen(screen);
+        let native = self.read_screen_at(screen, right);
         if scale == 1 {
             return (std::sync::Arc::new(native), width, height);
         }
         (std::sync::Arc::new(grow(&native, width, scale)), width * scale, height * scale)
+    }
+
+    /// whether the title draws the top screen in 3D, a picture for each
+    /// eye. its format asks for the screen's two buffers, the second for
+    /// the right eye, which the console's GSP turns the 3D on for only
+    /// with bit 5 set and bit 6 clear.
+    pub fn draws_in_3d(&self) -> bool {
+        let config = self.gpu.framebuffers[0];
+        config.format & 0x60 == 0x20 && config.address_right() != 0
+    }
+
+    /// moves the 3D slider, which titles read every frame to decide whether
+    /// and how deep to draw in 3D, 0 down and 1 all the way up.
+    pub fn set_slider_3d(&mut self, value: f32) {
+        self.config.slider_3d = value;
+        memory::config::set_slider_3d(self.memory.phys.shared_page_mut(), value);
     }
 
     /// where a screen's picture is on the host's GPU, for a presenter sharing
@@ -970,10 +996,23 @@ impl System {
     /// has that. the presenter's work runs after the GPU draws the picture, so
     /// the newest goes up.
     pub fn gpu_screen(&mut self, screen: zakuro_common::Screen) -> Option<zakuro_gpu::GpuScreen> {
+        self.gpu_picture(screen, false)
+    }
+
+    /// the top screen's picture for the right eye on the host's GPU, as
+    /// gpu_screen gives the left one's, when the title draws in 3D.
+    pub fn gpu_right_eye(&mut self) -> Option<zakuro_gpu::GpuScreen> {
+        if !self.draws_in_3d() {
+            return None;
+        }
+        self.gpu_picture(zakuro_common::Screen::Top, true)
+    }
+
+    fn gpu_picture(&mut self, screen: zakuro_common::Screen, right: bool) -> Option<zakuro_gpu::GpuScreen> {
         if !self.gpu.shows_directly() {
             return None;
         }
-        let now = self.screen_ref(screen)?;
+        let now = self.screen_ref(screen, right)?;
         // frame interpolation's picture in between, where the screen has one
         if self.pacing.between {
             if let Some(between) = self.gpu.between_image(now) {
@@ -987,20 +1026,21 @@ impl System {
     /// picture in between it and the one before, see pace, for saving it.
     /// it waits for the GPU.
     pub fn upright_screen(&mut self, screen: zakuro_common::Screen, between: bool) -> Option<Screen> {
-        let now = self.screen_ref(screen)?;
+        let now = self.screen_ref(screen, false)?;
         let (image, scale) = self.gpu.upright_picture(now, between)?;
         Some((image, screen.width() * scale, screen.height() * scale))
     }
 
     /// the picture the host's GPU drew scaled for a screen, when it is still
     /// what the screen shows.
-    fn scaled_screen(&mut self, screen: zakuro_common::Screen) -> Option<Screen> {
+    fn scaled_screen(&mut self, screen: zakuro_common::Screen, right: bool) -> Option<Screen> {
         let (width, height) = (screen.width(), screen.height());
         let index = match screen {
+            _ if right => 2,
             zakuro_common::Screen::Top => 0,
             zakuro_common::Screen::Bottom => 1,
         };
-        let Some(now) = self.screen_ref(screen) else {
+        let Some(now) = self.screen_ref(screen, right) else {
             self.showing[index] = None;
             return None;
         };
@@ -1012,15 +1052,15 @@ impl System {
     }
 
     /// the picture the host's GPU drew for a screen, when it is still what
-    /// the screen shows.
-    fn screen_ref(&mut self, screen: zakuro_common::Screen) -> Option<zakuro_gpu::ScreenRef> {
+    /// the screen shows, the top one's for the right eye when right.
+    fn screen_ref(&mut self, screen: zakuro_common::Screen, right: bool) -> Option<zakuro_gpu::ScreenRef> {
         let (width, height) = (screen.width(), screen.height());
         let index = match screen {
             zakuro_common::Screen::Top => 0,
             zakuro_common::Screen::Bottom => 1,
         };
         let config = self.gpu.framebuffers[index];
-        let address = config.address_left();
+        let address = if right { config.address_right() } else { config.address_left() };
         let format = config.color_format();
         let bpp = format.bytes_per_pixel() as u32;
         // plain buffers a row per screen column, as display transfers leave
@@ -1045,6 +1085,11 @@ impl System {
 
     /// reads one screen into a straight RGBA8 buffer for presentation.
     pub fn read_screen(&mut self, screen: zakuro_common::Screen) -> Vec<u8> {
+        self.read_screen_at(screen, false)
+    }
+
+    /// the same, the top screen's picture for the right eye when right.
+    fn read_screen_at(&mut self, screen: zakuro_common::Screen, right: bool) -> Vec<u8> {
         let index = match screen {
             zakuro_common::Screen::Top => 0,
             zakuro_common::Screen::Bottom => 1,
@@ -1054,7 +1099,7 @@ impl System {
         let height = screen.height();
         let mut out = vec![0u8; (width * height * 4) as usize];
 
-        let address = config.address_left();
+        let address = if right { config.address_right() } else { config.address_left() };
         if self.lcd_force_black || address == 0 {
             return out;
         }
@@ -1447,6 +1492,28 @@ mod tests {
         system.step(None);
         assert_eq!(system.kernel.current_thread, Some(id));
         assert_eq!(system.cpu.regs[0], 0, "the wait's result, not the handle");
+    }
+
+    /// the top screen's second buffer is the right eye's only while its
+    /// format asks for the 3D the way the console's GSP takes it, bit 5 set
+    /// and bit 6 clear, and the title gave it one.
+    #[test]
+    fn the_right_eye_shows_only_while_the_title_asks_for_3d() {
+        let mut system = System::new(Config::default());
+        let config = &mut system.gpu.framebuffers[0];
+        config.address_a_left = 0x1830_0000;
+        config.address_a_right = 0x1834_6500;
+        for (format, right) in [(0x20, true), (0x60, false), (0x40, false), (0x00, false)] {
+            system.gpu.framebuffers[0].format = 0x0300 | format | 1;
+            assert_eq!(system.draws_in_3d(), right, "format 0x{format:X}");
+        }
+        system.gpu.framebuffers[0].address_a_right = 0;
+        system.gpu.framebuffers[0].format = 0x0321;
+        assert!(!system.draws_in_3d(), "no buffer for the right eye");
+        // the slider games read moves with it
+        system.set_slider_3d(0.5);
+        let page = system.memory.phys.shared_page_mut();
+        assert_eq!((f32::from_le_bytes(page[0x80..0x84].try_into().unwrap()), page[0x84]), (0.5, 0), "the LED not forced off");
     }
 
     /// a zero sleep with nobody else ready to run is a no-op: the calling

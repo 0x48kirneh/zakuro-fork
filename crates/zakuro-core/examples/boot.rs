@@ -53,6 +53,9 @@ fn main() {
         // ZAKURO_PRESENT=direct, and saves them with the screens
         interpolate: std::env::var("ZAKURO_INTERPOLATE").is_ok_and(|v| v == "1"),
         skip_idle_loops: std::env::var("ZAKURO_IDLE").map_or(true, |v| v != "0"),
+        // ZAKURO_3D=0.5 is where the 3D slider is, the right eye's picture
+        // saved with the screens when the game draws one
+        slider_3d: std::env::var("ZAKURO_3D").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0),
         device: std::env::var("ZAKURO_PRESENT").is_ok_and(|v| v == "direct").then(|| {
             let device = zakuro_gpu::SharedDevice::new().unwrap_or_else(|error| {
                 eprintln!("no device to show the screens from: {error}");
@@ -315,6 +318,9 @@ fn main() {
             audio.extend(system.take_audio());
         }
         if dump_at.contains(&executed) {
+            if let Some(right) = system.read_right_eye_scaled() {
+                save_picture(&right, &temp(&format!("zakuro-top-right-{executed}.ppm")));
+            }
             for (screen, name) in SCREENS {
                 save_screen(&mut system, screen, &temp(&format!("zakuro-{name}-{executed}.ppm")));
                 // and as the GPU has them, with the pictures in between
@@ -536,12 +542,13 @@ fn main() {
     for (index, name) in [(0, "top"), (1, "bottom")] {
         let config = system.gpu.framebuffers[index];
         println!(
-            "{name} framebuffer: A 0x{:08X} B 0x{:08X} active {} (showing 0x{:08X}) \
+            "{name} framebuffer: A 0x{:08X} B 0x{:08X} active {} (showing 0x{:08X}, right eye 0x{:08X}) \
              stride {} format 0x{:X}",
             config.address_a_left,
             config.address_b_left,
             config.active,
             config.address_left(),
+            config.address_right(),
             config.stride,
             config.format
         );

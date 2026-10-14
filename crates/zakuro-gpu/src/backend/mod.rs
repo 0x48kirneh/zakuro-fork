@@ -207,6 +207,82 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout, 
     (top, bottom)
 }
 
+/// how the top screen's two pictures, one for each eye, are shown when the
+/// title draws in 3D.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StereoMode {
+    /// the left eye's picture alone, as with the 3D slider down.
+    #[default]
+    Off,
+    /// the eyes mixed into red for the left one and cyan for the right, for
+    /// glasses of those colors.
+    Anaglyph,
+    /// each eye in its half of the window, for 3D TVs and headsets.
+    SideBySide,
+    /// the same squeezed to half width, which a 3D TV stretches back.
+    HalfSideBySide,
+    /// the eyes on alternate rows of the window, for passive 3D monitors.
+    Interlaced,
+}
+
+/// the 3D a presenter shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Stereo {
+    pub mode: StereoMode,
+    /// the right eye's picture where the left one's goes, for viewing cross
+    /// eyed, glasses worn the other way round or rows counted the other way.
+    pub swap: bool,
+}
+
+/// which picture a place in the window shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shown {
+    /// the top screen, as the left eye sees it.
+    Top,
+    /// the top screen as the right eye sees it.
+    Right,
+    Bottom,
+    /// the top screen's two pictures mixed the way the stereo mode does.
+    Both,
+}
+
+/// the screens a frame draws, where and from which picture. the 3D shows
+/// when the title drew a picture for the right eye, side by side shows the
+/// left one's twice otherwise, so a 3D TV keeps its halves.
+pub fn place(window_width: u32, window_height: u32, arrangement: ScreenLayout, integer: bool, stereo: Stereo, right: bool) -> Vec<(Viewport, Shown)> {
+    let screens = |(top, bottom): (Option<Viewport>, Option<Viewport>), eye: Shown| {
+        top.map(|viewport| (viewport, eye)).into_iter().chain(bottom.map(|viewport| (viewport, Shown::Bottom)))
+    };
+    let (first, second) = match (right, stereo.swap) {
+        (false, _) => (Shown::Top, Shown::Top),
+        (true, false) => (Shown::Top, Shown::Right),
+        (true, true) => (Shown::Right, Shown::Top),
+    };
+    match stereo.mode {
+        StereoMode::Off => screens(layout(window_width, window_height, arrangement, integer), Shown::Top).collect(),
+        StereoMode::Anaglyph | StereoMode::Interlaced => {
+            let top = if right { Shown::Both } else { Shown::Top };
+            screens(layout(window_width, window_height, arrangement, integer), top).collect()
+        }
+        StereoMode::SideBySide => {
+            // each half a window of its own
+            let half = window_width / 2;
+            let places = layout(half, window_height, arrangement, integer);
+            let moved = |(viewport, shown): (Viewport, Shown)| (Viewport { x: viewport.x + half as f32, ..viewport }, shown);
+            screens(places, first).chain(screens(places, second).map(moved)).collect()
+        }
+        StereoMode::HalfSideBySide => {
+            // the whole window's places, squeezed into each half
+            let places = layout(window_width, window_height, arrangement, integer);
+            let half = window_width as f32 / 2.0;
+            let squeezed = |by: f32| move |(viewport, shown): (Viewport, Shown)| {
+                (Viewport { x: viewport.x / 2.0 + by, width: viewport.width / 2.0, ..viewport }, shown)
+            };
+            screens(places, first).map(squeezed(0.0)).chain(screens(places, second).map(squeezed(half))).collect()
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PresentError {
     #[error("{0}")]
@@ -218,11 +294,14 @@ pub enum PresentError {
 pub trait Presenter {
     fn name(&self) -> &'static str;
 
-    /// draws both screens into the window, and the overlay over them.
+    /// draws both screens into the window, and the overlay over them. right
+    /// is the top screen's picture for the right eye, empty when the title
+    /// draws no 3D or none is shown.
     fn present(
         &mut self,
         top: ScreenImage<'_>,
         bottom: ScreenImage<'_>,
+        right: ScreenImage<'_>,
         overlay: &Overlay,
     ) -> Result<(), PresentError>;
 
@@ -235,6 +314,9 @@ pub trait Presenter {
     /// how the screens are filtered, and whether they are scaled by whole
     /// numbers, from the next frame on.
     fn set_scaling(&mut self, filter: ScreenFilter, integer: bool);
+
+    /// how the 3D shows from the next frame on.
+    fn set_stereo(&mut self, stereo: Stereo);
 }
 
 #[cfg(test)]
@@ -293,6 +375,49 @@ mod tests {
         let (top, bottom) = (top.unwrap(), bottom.unwrap());
         assert_eq!((top.x, top.y, top.width, top.height), (0.0, 0.0, 800.0, 480.0));
         assert_eq!((bottom.x, bottom.y, bottom.width, bottom.height), (800.0, 240.0, 320.0, 240.0));
+    }
+
+    /// the screens each stereo mode draws, from which picture and where.
+    #[test]
+    fn the_stereo_modes_place_the_eyes() {
+        let on = |mode| Stereo { mode, swap: false };
+        let shown = |places: &[(Viewport, Shown)]| places.iter().map(|(_, shown)| *shown).collect::<Vec<_>>();
+        let at = |places: &[(Viewport, Shown)], index: usize| {
+            let viewport = places[index].0;
+            (viewport.x, viewport.y, viewport.width, viewport.height)
+        };
+
+        // off, or a title drawing no 3D, the screens as ever
+        let off = place(400, 480, ScreenLayout::Stacked, false, on(StereoMode::Off), true);
+        assert_eq!(shown(&off), [Shown::Top, Shown::Bottom]);
+        let flat = place(400, 480, ScreenLayout::Stacked, false, on(StereoMode::Anaglyph), false);
+        assert_eq!(shown(&flat), [Shown::Top, Shown::Bottom]);
+
+        // red and cyan or rows, both pictures where the top screen goes
+        let mixed = place(400, 480, ScreenLayout::Stacked, false, on(StereoMode::Interlaced), true);
+        assert_eq!(shown(&mixed), [Shown::Both, Shown::Bottom]);
+        assert_eq!(at(&mixed, 0), (0.0, 0.0, 400.0, 240.0));
+
+        // side by side, each half a window of its own
+        let halves = place(800, 480, ScreenLayout::Stacked, false, on(StereoMode::SideBySide), true);
+        assert_eq!(shown(&halves), [Shown::Top, Shown::Bottom, Shown::Right, Shown::Bottom]);
+        assert_eq!(at(&halves, 0), (0.0, 0.0, 400.0, 240.0));
+        assert_eq!(at(&halves, 2), (400.0, 0.0, 400.0, 240.0));
+        assert_eq!(at(&halves, 3), (440.0, 240.0, 320.0, 240.0));
+
+        // squeezed, the whole window's places at half width in each half
+        let squeezed = place(800, 480, ScreenLayout::Stacked, false, on(StereoMode::HalfSideBySide), true);
+        assert_eq!(shown(&squeezed), [Shown::Top, Shown::Bottom, Shown::Right, Shown::Bottom]);
+        assert_eq!(at(&squeezed, 0), (100.0, 0.0, 200.0, 240.0));
+        assert_eq!(at(&squeezed, 1), (120.0, 240.0, 160.0, 240.0));
+        assert_eq!(at(&squeezed, 2), (500.0, 0.0, 200.0, 240.0));
+
+        // swapped, the right eye on the left, and with no 3D drawn both
+        // halves the left eye's
+        let swapped = place(800, 480, ScreenLayout::Stacked, false, Stereo { mode: StereoMode::SideBySide, swap: true }, true);
+        assert_eq!(shown(&swapped), [Shown::Right, Shown::Bottom, Shown::Top, Shown::Bottom]);
+        let flat = place(800, 480, ScreenLayout::TopOnly, false, on(StereoMode::SideBySide), false);
+        assert_eq!(shown(&flat), [Shown::Top, Shown::Top]);
     }
 
     #[test]

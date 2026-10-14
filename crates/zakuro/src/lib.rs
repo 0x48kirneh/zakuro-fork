@@ -480,6 +480,7 @@ impl ApplicationHandler for App {
                 log::info!("presenting with the {} backend", backend.name());
                 backend.set_layout(self.layout.screens());
                 backend.set_scaling(self.settings.filter.screens(), self.settings.integer_scale);
+                backend.set_stereo(self.settings.stereo());
                 self.gui = Some(Gui::new(&window));
                 self.window = Some(window);
                 self.backend = Some(backend);
@@ -576,6 +577,7 @@ impl App {
             device: self.backend.as_ref().and_then(Backend::shared_device),
             username: self.nickname(),
             console_id: self.settings.console_id,
+            slider_3d: self.settings.slider_3d(),
             ..Config::default()
         }
     }
@@ -837,6 +839,11 @@ impl App {
                 let on = game.system.set_interpolation(self.settings.frame_interpolation);
                 log::info!("frame interpolation {}", if on { "on" } else { "off" });
             }
+            // games read the 3D slider every frame
+            let slider = self.settings.slider_3d();
+            if game.system.config.slider_3d != slider {
+                game.system.set_slider_3d(slider);
+            }
         }
         self.apply_camera();
         self.keyboard.set_keys(self.settings.keys.clone());
@@ -875,6 +882,7 @@ impl App {
     fn apply_layout(&mut self) {
         if let Some(backend) = &mut self.backend {
             backend.set_scaling(self.settings.filter.screens(), self.settings.integer_scale);
+            backend.set_stereo(self.settings.stereo());
         }
         let scale = if self.options.scale.is_none() { self.settings.scale.max(1) } else { self.scale };
         if scale != self.scale || self.settings.layout != self.layout {
@@ -1519,15 +1527,24 @@ impl App {
     fn present(&mut self, event_loop: &ActiveEventLoop) {
         let overlay = self.interface(event_loop);
         let blank = |screen: Screen| ((std::sync::Arc::new(Vec::new()), screen.width(), screen.height()), None);
-        let (top, bottom) = match &mut self.game {
-            Some(game) => (shown(&mut game.system, Screen::Top), shown(&mut game.system, Screen::Bottom)),
-            None => (blank(Screen::Top), blank(Screen::Bottom)),
+        // the right eye's picture only while the 3D shows
+        let stereo = self.settings.stereo != settings::Stereo3d::Off;
+        let (top, bottom, right) = match &mut self.game {
+            Some(game) => (
+                shown(&mut game.system, Screen::Top),
+                shown(&mut game.system, Screen::Bottom),
+                stereo.then(|| shown_right(&mut game.system)).flatten(),
+            ),
+            None => (blank(Screen::Top), blank(Screen::Bottom), None),
         };
+        let right = right.unwrap_or_else(|| blank(Screen::Top));
         let Some(backend) = &mut self.backend else { return };
         let (((top, top_width, top_height), top_gpu), ((bottom, bottom_width, bottom_height), bottom_gpu)) = (top, bottom);
+        let ((right, right_width, right_height), right_gpu) = right;
         let result = backend.present(
             ScreenImage { width: top_width, height: top_height, pixels: &top, gpu: top_gpu },
             ScreenImage { width: bottom_width, height: bottom_height, pixels: &bottom, gpu: bottom_gpu },
+            ScreenImage { width: right_width, height: right_height, pixels: &right, gpu: right_gpu },
             &overlay,
         );
         match result {
@@ -1593,6 +1610,16 @@ fn shown(system: &mut System, screen: Screen) -> (zakuro_core::Screen, Option<Gp
         return ((std::sync::Arc::new(Vec::new()), screen.width() * scale, screen.height() * scale), Some(gpu));
     }
     (system.read_screen_scaled(screen), None)
+}
+
+/// the top screen's picture for the right eye, as shown gives the screens,
+/// when the game draws in 3D.
+fn shown_right(system: &mut System) -> Option<(zakuro_core::Screen, Option<GpuScreen>)> {
+    if let Some(gpu) = system.gpu_right_eye() {
+        let scale = system.gpu.scale();
+        return Some(((std::sync::Arc::new(Vec::new()), Screen::Top.width() * scale, Screen::Top.height() * scale), Some(gpu)));
+    }
+    system.read_right_eye_scaled().map(|screen| (screen, None))
 }
 
 /// keeps the renderer kind referenced even when a backend feature is off.

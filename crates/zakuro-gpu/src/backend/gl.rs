@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use glow::HasContext;
 
-use super::{layout, Overlay, OverlayVertex, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, Viewport};
+use super::{place, Overlay, OverlayVertex, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, Shown, Stereo, StereoMode, Viewport};
 
 const VERTEX_SHADER: &str = r#"#version 330 core
 // a single oversized triangle covers the viewport with no vertex buffer.
@@ -17,16 +17,18 @@ void main() {
 "#;
 
 // a screen bigger than the window shows it is averaged over every texel a
-// pixel covers, the way the Vulkan presenter does it.
-const FRAGMENT_SHADER: &str = r#"#version 330 core
+// pixel covers, the way the Vulkan presenter does it. shown samples one of
+// the pictures, the shaders put together from it draw one screen, or the
+// top screen's two pictures in one for 3D.
+const SAMPLE: &str = r#"#version 330 core
 in vec2 uv;
 out vec4 color;
 uniform sampler2D screen;
 // how a screen drawn bigger than its pixels is filtered: 0 smooth, 1
 // pixels, 2 sharp, as in the Vulkan presenter's shader.
 uniform int mode;
-void main() {
-    vec2 size = vec2(textureSize(screen, 0));
+vec3 shown(sampler2D image) {
+    vec2 size = vec2(textureSize(image, 0));
     vec2 covered = fwidth(uv) * size;
     if (max(covered.x, covered.y) <= 1.001) {
         vec2 texel = uv * size;
@@ -39,18 +41,50 @@ void main() {
             vec2 blend = clamp((fract(centred) - 0.5) * scale + 0.5, 0.0, 1.0);
             at = (floor(centred) + 0.5 + blend) / size;
         }
-        color = vec4(texture(screen, at).rgb, 1.0);
-        return;
+        return texture(image, at).rgb;
     }
     ivec2 taps = ivec2(clamp(ceil(covered), 1.0, 4.0));
     vec3 sum = vec3(0.0);
     for (int y = 0; y < taps.y; y++) {
         for (int x = 0; x < taps.x; x++) {
             vec2 offset = ((vec2(x, y) + 0.5) / vec2(taps) - 0.5) * covered / size;
-            sum += texture(screen, uv + offset).rgb;
+            sum += texture(image, uv + offset).rgb;
         }
     }
-    color = vec4(sum / float(taps.x * taps.y), 1.0);
+    return sum / float(taps.x * taps.y);
+}
+"#;
+
+const SCREEN_MAIN: &str = r#"
+void main() {
+    color = vec4(shown(screen), 1.0);
+}
+"#;
+
+// as the Vulkan presenter's shader does it, with rows counted from the top
+// of the window, which OpenGL counts from the bottom.
+const STEREO_MAIN: &str = r#"
+uniform sampler2D right_eye;
+// 1 red and cyan, 2 alternate rows, whether the eyes swap, and the
+// window's height
+uniform int stereo;
+uniform int swap;
+uniform float height;
+void main() {
+    vec3 left = shown(screen);
+    vec3 right = shown(right_eye);
+    if (swap != 0) {
+        vec3 other = left;
+        left = right;
+        right = other;
+    }
+    if (stereo == 1) {
+        vec3 red = vec3(dot(left, vec3(0.437, 0.449, 0.164)), dot(left, vec3(-0.062, -0.062, -0.024)), dot(left, vec3(-0.048, -0.050, -0.017)));
+        vec3 cyan = vec3(dot(right, vec3(-0.011, -0.032, -0.007)), dot(right, vec3(0.377, 0.761, 0.009)), dot(right, vec3(-0.026, -0.093, 1.234)));
+        color = vec4(clamp(red + cyan, 0.0, 1.0), 1.0);
+    } else {
+        color = vec4((int(height - gl_FragCoord.y) & 1) == 0 ? left : right, 1.0);
+    }
 }
 "#;
 
@@ -91,17 +125,21 @@ struct GlOverlay {
 pub struct GlPresenter {
     gl: glow::Context,
     program: glow::Program,
+    /// what draws the top screen's two pictures in one, for 3D.
+    stereo_program: glow::Program,
     vertex_array: glow::VertexArray,
     overlay: GlOverlay,
-    /// index 0 is the top screen, 1 the bottom.
-    textures: [glow::Texture; 2],
+    /// index 0 is the top screen, 1 the bottom, 2 the top one's picture
+    /// for the right eye.
+    textures: [glow::Texture; 3],
     /// dimensions each texture was last allocated at, so uploads can use
     /// tex_sub_image_2d when nothing changed.
-    sizes: [(u32, u32); 2],
+    sizes: [(u32, u32); 3],
     window: (u32, u32),
     arrangement: ScreenLayout,
     filter: ScreenFilter,
     integer: bool,
+    stereo: Stereo,
 }
 
 impl GlPresenter {
@@ -121,12 +159,13 @@ impl GlPresenter {
         let renderer = unsafe { gl.get_parameter_string(glow::RENDERER) };
         log::info!("OpenGL {version} on {renderer}");
 
-        let program = unsafe { link_program(&gl, VERTEX_SHADER, FRAGMENT_SHADER)? };
+        let program = unsafe { link_program(&gl, VERTEX_SHADER, &format!("{SAMPLE}{SCREEN_MAIN}"))? };
+        let stereo_program = unsafe { link_program(&gl, VERTEX_SHADER, &format!("{SAMPLE}{STEREO_MAIN}"))? };
         let vertex_array = unsafe { gl.create_vertex_array() }
             .map_err(PresentError::Backend)?;
 
-        let mut textures = Vec::with_capacity(2);
-        for _ in 0..2 {
+        let mut textures = Vec::with_capacity(3);
+        for _ in 0..3 {
             let texture = unsafe { gl.create_texture() }.map_err(PresentError::Backend)?;
             unsafe {
                 gl.bind_texture(glow::TEXTURE_2D, Some(texture));
@@ -160,14 +199,16 @@ impl GlPresenter {
         Ok(GlPresenter {
             gl,
             program,
+            stereo_program,
             vertex_array,
             overlay,
-            textures: [textures[0], textures[1]],
-            sizes: [(0, 0); 2],
+            textures: [textures[0], textures[1], textures[2]],
+            sizes: [(0, 0); 3],
             window,
             arrangement: ScreenLayout::default(),
             filter: ScreenFilter::default(),
             integer: false,
+            stereo: Stereo::default(),
         })
     }
 
@@ -204,19 +245,59 @@ impl GlPresenter {
         }
     }
 
-    fn draw_screen(&self, index: usize, viewport: Viewport) {
+    /// the program, and the uniforms the two programs share.
+    fn use_program(&self, program: glow::Program) {
         let gl = &self.gl;
         unsafe {
-            // OpenGL's origin is the bottom left, so the y coordinate flips.
-            let y = self.window.1 as f32 - viewport.y - viewport.height;
-            gl.viewport(
-                viewport.x as i32,
-                y as i32,
-                viewport.width as i32,
-                viewport.height as i32,
-            );
+            gl.use_program(Some(program));
+            if let Some(location) = gl.get_uniform_location(program, "screen") {
+                gl.uniform_1_i32(Some(&location), 0);
+            }
+            if let Some(location) = gl.get_uniform_location(program, "mode") {
+                gl.uniform_1_i32(Some(&location), self.filter.mode());
+            }
+        }
+    }
+
+    fn set_viewport(&self, viewport: Viewport) {
+        // OpenGL's origin is the bottom left, so the y coordinate flips.
+        let y = self.window.1 as f32 - viewport.y - viewport.height;
+        unsafe { self.gl.viewport(viewport.x as i32, y as i32, viewport.width as i32, viewport.height as i32) };
+    }
+
+    fn draw_screen(&self, index: usize, viewport: Viewport) {
+        let gl = &self.gl;
+        self.use_program(self.program);
+        self.set_viewport(viewport);
+        unsafe {
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(self.textures[index]));
+            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+        }
+    }
+
+    /// the top screen's two pictures in one, as the stereo mode mixes them.
+    fn draw_both(&self, viewport: Viewport) {
+        let gl = &self.gl;
+        let program = self.stereo_program;
+        self.use_program(program);
+        self.set_viewport(viewport);
+        unsafe {
+            let set = |name: &str, value: i32| {
+                if let Some(location) = gl.get_uniform_location(program, name) {
+                    gl.uniform_1_i32(Some(&location), value);
+                }
+            };
+            set("right_eye", 1);
+            set("stereo", if self.stereo.mode == StereoMode::Anaglyph { 1 } else { 2 });
+            set("swap", self.stereo.swap as i32);
+            if let Some(location) = gl.get_uniform_location(program, "height") {
+                gl.uniform_1_f32(Some(&location), self.window.1 as f32);
+            }
+            gl.active_texture(glow::TEXTURE1);
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.textures[2]));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.textures[0]));
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
         }
     }
@@ -231,6 +312,7 @@ impl Presenter for GlPresenter {
         &mut self,
         top: ScreenImage<'_>,
         bottom: ScreenImage<'_>,
+        right: ScreenImage<'_>,
         overlay: &Overlay,
     ) -> Result<(), PresentError> {
         if !top.is_empty() {
@@ -239,28 +321,27 @@ impl Presenter for GlPresenter {
         if !bottom.is_empty() {
             self.upload(1, &bottom);
         }
+        let has_right = !right.is_empty();
+        if has_right {
+            self.upload(2, &right);
+        }
 
         let gl = &self.gl;
         unsafe {
             gl.viewport(0, 0, self.window.0 as i32, self.window.1 as i32);
             gl.clear_color(0.0, 0.0, 0.0, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
-            gl.use_program(Some(self.program));
             gl.bind_vertex_array(Some(self.vertex_array));
-            if let Some(location) = gl.get_uniform_location(self.program, "screen") {
-                gl.uniform_1_i32(Some(&location), 0);
-            }
-            if let Some(location) = gl.get_uniform_location(self.program, "mode") {
-                gl.uniform_1_i32(Some(&location), self.filter.mode());
-            }
         }
 
-        let (top_viewport, bottom_viewport) = layout(self.window.0, self.window.1, self.arrangement, self.integer);
-        if let Some(viewport) = top_viewport.filter(|_| !top.is_empty()) {
-            self.draw_screen(0, viewport);
-        }
-        if let Some(viewport) = bottom_viewport.filter(|_| !bottom.is_empty()) {
-            self.draw_screen(1, viewport);
+        for (viewport, shown) in place(self.window.0, self.window.1, self.arrangement, self.integer, self.stereo, has_right) {
+            match shown {
+                Shown::Top if !top.is_empty() => self.draw_screen(0, viewport),
+                Shown::Bottom if !bottom.is_empty() => self.draw_screen(1, viewport),
+                Shown::Right => self.draw_screen(2, viewport),
+                Shown::Both if !top.is_empty() => self.draw_both(viewport),
+                _ => {}
+            }
         }
 
         unsafe {
@@ -282,12 +363,17 @@ impl Presenter for GlPresenter {
         self.filter = filter;
         self.integer = integer;
     }
+
+    fn set_stereo(&mut self, stereo: Stereo) {
+        self.stereo = stereo;
+    }
 }
 
 impl Drop for GlPresenter {
     fn drop(&mut self) {
         unsafe {
             self.gl.delete_program(self.program);
+            self.gl.delete_program(self.stereo_program);
             self.gl.delete_vertex_array(self.vertex_array);
             self.gl.delete_program(self.overlay.program);
             self.gl.delete_vertex_array(self.overlay.vertex_array);

@@ -35,7 +35,7 @@ impl Screens {
     pub fn name(self) -> &'static str {
         match self {
             Screens::Stacked => "Top over bottom",
-            Screens::SideBySide => "Side by side",
+            Screens::SideBySide => "Screens side by side",
             Screens::TopOnly => "Top screen only",
             Screens::BottomOnly => "Bottom screen only",
             Screens::LargeTop => "Big top screen, small bottom one",
@@ -94,6 +94,43 @@ impl Filter {
             Filter::Smooth => zakuro_gpu::ScreenFilter::Smooth,
             Filter::Sharp => zakuro_gpu::ScreenFilter::Sharp,
             Filter::Pixels => zakuro_gpu::ScreenFilter::Pixels,
+        }
+    }
+}
+
+/// how the top screen's 3D shows, for games that draw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stereo3d {
+    /// games draw flat, as with the console's 3D slider down.
+    #[default]
+    Off,
+    Anaglyph,
+    SideBySide,
+    HalfSideBySide,
+    Interlaced,
+}
+
+impl Stereo3d {
+    pub const ALL: [Stereo3d; 5] = [Stereo3d::Off, Stereo3d::Anaglyph, Stereo3d::SideBySide, Stereo3d::HalfSideBySide, Stereo3d::Interlaced];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Stereo3d::Off => "Off",
+            Stereo3d::Anaglyph => "Red and cyan glasses",
+            Stereo3d::SideBySide => "Side by side",
+            Stereo3d::HalfSideBySide => "Side by side, half width",
+            Stereo3d::Interlaced => "Alternate rows",
+        }
+    }
+
+    pub fn mode(self) -> zakuro_gpu::StereoMode {
+        match self {
+            Stereo3d::Off => zakuro_gpu::StereoMode::Off,
+            Stereo3d::Anaglyph => zakuro_gpu::StereoMode::Anaglyph,
+            Stereo3d::SideBySide => zakuro_gpu::StereoMode::SideBySide,
+            Stereo3d::HalfSideBySide => zakuro_gpu::StereoMode::HalfSideBySide,
+            Stereo3d::Interlaced => zakuro_gpu::StereoMode::Interlaced,
         }
     }
 }
@@ -402,6 +439,13 @@ pub struct Settings {
     pub filter: Filter,
     /// scale the screens by whole numbers only, leaving a border.
     pub integer_scale: bool,
+    /// how the 3D shows.
+    #[serde(deserialize_with = "or_default")]
+    pub stereo: Stereo3d,
+    /// how deep games draw the 3D, the console's slider, 0 to 100.
+    pub depth_3d: u32,
+    /// each eye gets the other's picture.
+    pub swap_eyes: bool,
     /// 0 to 1.
     pub volume: f32,
     pub mute: bool,
@@ -444,6 +488,9 @@ impl Default for Settings {
             layout: Screens::Stacked,
             filter: Filter::Smooth,
             integer_scale: false,
+            stereo: Stereo3d::Off,
+            depth_3d: 50,
+            swap_eyes: false,
             volume: 1.0,
             mute: false,
             show_fps: false,
@@ -476,6 +523,21 @@ where
 }
 
 impl Settings {
+    /// where the console's 3D slider is, down while the 3D is off, so games
+    /// do not draw a picture nobody sees.
+    pub fn slider_3d(&self) -> f32 {
+        if self.stereo == Stereo3d::Off {
+            0.0
+        } else {
+            self.depth_3d.min(100) as f32 / 100.0
+        }
+    }
+
+    /// the 3D the presenter shows.
+    pub fn stereo(&self) -> zakuro_gpu::Stereo {
+        zakuro_gpu::Stereo { mode: self.stereo.mode(), swap: self.swap_eyes }
+    }
+
     /// the saved settings, or the defaults when there are none.
     pub fn load() -> Settings {
         let Some(path) = path() else { return Settings::default() };

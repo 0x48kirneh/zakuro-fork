@@ -102,6 +102,14 @@ impl Backend {
         }
     }
 
+    pub fn set_stereo(&mut self, stereo: zakuro_gpu::Stereo) {
+        match self {
+            Backend::OpenGl { presenter, .. } => presenter.set_stereo(stereo),
+            Backend::Vulkan(presenter) => presenter.set_stereo(stereo),
+            Backend::None => {}
+        }
+    }
+
     pub fn set_layout(&mut self, arrangement: ScreenLayout) {
         match self {
             Backend::OpenGl { presenter, .. } => presenter.set_layout(arrangement),
@@ -114,6 +122,7 @@ impl Backend {
         &mut self,
         top: ScreenImage<'_>,
         bottom: ScreenImage<'_>,
+        right: ScreenImage<'_>,
         overlay: &Overlay,
     ) -> Result<(), PresentError> {
         match self {
@@ -122,12 +131,12 @@ impl Backend {
                 context,
                 surface,
             } => {
-                presenter.present(top, bottom, overlay)?;
+                presenter.present(top, bottom, right, overlay)?;
                 surface
                     .swap_buffers(context)
                     .map_err(|e| PresentError::Backend(e.to_string()))
             }
-            Backend::Vulkan(presenter) => presenter.present(top, bottom, overlay),
+            Backend::Vulkan(presenter) => presenter.present(top, bottom, right, overlay),
             Backend::None => Ok(()),
         }
     }

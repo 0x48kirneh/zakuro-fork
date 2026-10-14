@@ -8,12 +8,19 @@ use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use super::vulkan_overlay::OverlayPainter;
-use super::{layout, GpuScreen, Overlay, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, Viewport};
+use super::{place, GpuScreen, Overlay, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, Shown, Stereo, StereoMode, Viewport};
 use crate::raster::hardware::{can_render, render_device};
 use crate::SharedDevice;
 
 const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/present.vert.spv");
 const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present.frag.spv");
+const STEREO_FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/present_stereo.frag.spv");
+
+/// the bytes of push constants the fragment shader reads: where the screen
+/// lies in its image, the bounds its samples keep in and the filter, and
+/// for 3D how the eyes show and the right eye's place in its image.
+const CONSTANTS: u32 = 36;
+const STEREO_CONSTANTS: u32 = 80;
 
 /// how many frames may be recorded before waiting on the oldest.
 const FRAMES_IN_FLIGHT: usize = 2;
@@ -84,10 +91,16 @@ pub struct VulkanPresenter {
     descriptor_pool: vk::DescriptorPool,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    /// what draws the top screen's two pictures in one, for 3D in red and
+    /// cyan or on alternate rows, with a set per frame in flight.
+    stereo_layout: vk::DescriptorSetLayout,
+    stereo_pipeline_layout: vk::PipelineLayout,
+    stereo_pipeline: vk::Pipeline,
+    stereo_sets: Vec<vk::DescriptorSet>,
     sampler: vk::Sampler,
     /// a set per frame in flight and screen, pointed at the renderer's
     /// images when screens are drawn straight from them.
-    gpu_sets: Vec<[vk::DescriptorSet; 2]>,
+    gpu_sets: Vec<[vk::DescriptorSet; 3]>,
     /// the device and instance, when the renderer draws on them too, which
     /// go with the last of the two rather than with this.
     shared: Option<Arc<SharedDevice>>,
@@ -101,13 +114,16 @@ pub struct VulkanPresenter {
     in_flight: Vec<vk::Fence>,
     frame: usize,
 
-    screens: [Screen; 2],
+    /// the top screen, the bottom one and the top one's picture for the
+    /// right eye.
+    screens: [Screen; 3],
     /// what is drawn over the screens, none only while being dropped.
     overlay: Option<OverlayPainter>,
     window: (u32, u32),
     arrangement: ScreenLayout,
     filter: ScreenFilter,
     integer: bool,
+    stereo: Stereo,
     /// set when the swapchain no longer matches the window.
     stale: bool,
 }
@@ -205,9 +221,12 @@ impl VulkanPresenter {
         let surface_format = choose_format(&surface_instance, physical_device, surface)?;
         let render_pass = create_render_pass(&device, surface_format.format)?;
 
-        let descriptor_layout = create_descriptor_layout(&device)?;
+        let descriptor_layout = create_descriptor_layout(&device, 1)?;
         let (pipeline_layout, pipeline) =
-            create_pipeline(&device, render_pass, descriptor_layout)?;
+            create_pipeline(&device, render_pass, descriptor_layout, FRAGMENT_SPIRV, CONSTANTS)?;
+        let stereo_layout = create_descriptor_layout(&device, 2)?;
+        let (stereo_pipeline_layout, stereo_pipeline) =
+            create_pipeline(&device, render_pass, stereo_layout, STEREO_FRAGMENT_SPIRV, STEREO_CONSTANTS)?;
         let srgb = matches!(surface_format.format, vk::Format::B8G8R8A8_SRGB | vk::Format::R8G8B8A8_SRGB);
         let overlay = OverlayPainter::new(&device, render_pass, FRAMES_IN_FLIGHT, srgb)?;
 
@@ -228,12 +247,13 @@ impl VulkanPresenter {
 
         let descriptor_pool = unsafe {
             // a screen whose size changes is made again before the old one
-            // goes and gives its set back, so there is room for both, and
-            // the sets for the renderer's images
-            let sets = 4 + 2 * FRAMES_IN_FLIGHT as u32;
+            // goes and gives its set back, so there is room for both, then
+            // the sets for the renderer's images and the 3D sets, which hold
+            // two pictures each
+            let sets = 6 + 4 * FRAMES_IN_FLIGHT as u32;
             let sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(sets)];
+                .descriptor_count(6 + 5 * FRAMES_IN_FLIGHT as u32)];
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
@@ -245,7 +265,7 @@ impl VulkanPresenter {
         .map_err(vk_fail("creating the descriptor pool"))?;
 
         let gpu_sets = unsafe {
-            let layouts = [descriptor_layout; 2 * FRAMES_IN_FLIGHT];
+            let layouts = [descriptor_layout; 3 * FRAMES_IN_FLIGHT];
             device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(descriptor_pool)
@@ -253,9 +273,18 @@ impl VulkanPresenter {
             )
         }
         .map_err(vk_fail("allocating descriptor sets"))?
-        .chunks(2)
-        .map(|sets| [sets[0], sets[1]])
+        .chunks(3)
+        .map(|sets| [sets[0], sets[1], sets[2]])
         .collect();
+        let stereo_sets = unsafe {
+            let layouts = [stereo_layout; FRAMES_IN_FLIGHT];
+            device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&layouts),
+            )
+        }
+        .map_err(vk_fail("allocating descriptor sets"))?;
 
         let command_pool = unsafe {
             device.create_command_pool(
@@ -302,8 +331,8 @@ impl VulkanPresenter {
             );
         }
 
-        // the two screens start at their native sizes, upload grows them if
-        // a title ever reports something different.
+        // the screens start at their native sizes, upload grows them if a
+        // title ever reports something different.
         let screens = [
             Screen::new(
                 &device,
@@ -321,6 +350,15 @@ impl VulkanPresenter {
                 descriptor_layout,
                 sampler,
                 320,
+                240,
+            )?,
+            Screen::new(
+                &device,
+                &memory_properties,
+                descriptor_pool,
+                descriptor_layout,
+                sampler,
+                400,
                 240,
             )?,
         ];
@@ -349,6 +387,10 @@ impl VulkanPresenter {
             descriptor_pool,
             pipeline_layout,
             pipeline,
+            stereo_layout,
+            stereo_pipeline_layout,
+            stereo_pipeline,
+            stereo_sets,
             sampler,
             gpu_sets,
             shared: ManuallyDrop::into_inner(shared),
@@ -365,6 +407,7 @@ impl VulkanPresenter {
             arrangement: ScreenLayout::default(),
             filter: ScreenFilter::default(),
             integer: false,
+            stereo: Stereo::default(),
             stale: false,
         };
 
@@ -591,6 +634,29 @@ impl VulkanPresenter {
         Ok(if screen.initialized && screen.showing { Source::Own } else { Source::Nothing })
     }
 
+    /// points the frame's 3D set at the top screen's two pictures, wherever
+    /// each is drawn from.
+    fn write_stereo_set(&self, sources: &[Source; 3]) {
+        let view = |index: usize| match sources[index] {
+            Source::Gpu(gpu) => Some((gpu.view, vk::ImageLayout::GENERAL)),
+            Source::Own => Some((self.screens[index].view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)),
+            Source::Nothing => None,
+        };
+        let (Some(left), Some(right)) = (view(0), view(2)) else { return };
+        let infos = [left, right]
+            .map(|(view, layout)| [vk::DescriptorImageInfo::default().sampler(self.sampler).image_view(view).image_layout(layout)]);
+        let writes = [0, 1].map(|binding| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.stereo_sets[self.frame])
+                .dst_binding(binding as u32)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&infos[binding])
+        });
+        // SAFETY: the frame's fence was waited on, so no command using the
+        // set is in flight
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+    }
+
     /// keeps the overlay's changes for the next frame drawn.
     fn defer(&mut self, overlay: &Overlay) {
         if let Some(painter) = &mut self.overlay {
@@ -604,7 +670,8 @@ impl VulkanPresenter {
         framebuffer: vk::Framebuffer,
         painter: &mut OverlayPainter,
         overlay: &Overlay,
-        sources: [Source; 2],
+        sources: [Source; 3],
+        right: bool,
     ) -> Result<(), PresentError> {
         let device = &self.device;
         unsafe {
@@ -697,36 +764,42 @@ impl VulkanPresenter {
                     .clear_values(&clear),
                 vk::SubpassContents::INLINE,
             );
-            device.cmd_bind_pipeline(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline,
-            );
-
-            let (top, bottom) = layout(self.extent.width, self.extent.height, self.arrangement, self.integer);
-            for (index, viewport) in [top, bottom].into_iter().enumerate() {
-                let Some(viewport) = viewport else { continue };
-                let (descriptor, crop) = match sources[index] {
-                    Source::Nothing => continue,
-                    Source::Own => (self.screens[index].descriptor, WHOLE),
-                    Source::Gpu(gpu) => {
-                        let [x, y, width, height] = gpu.area;
-                        let [left, top, right, bottom] = gpu.bounds;
-                        (self.gpu_sets[self.frame][index], [x, y, width, height, left, top, right, bottom])
+            // each screen's set and place in its image
+            let crop = |index: usize| match sources[index] {
+                Source::Nothing => None,
+                Source::Own => Some((self.screens[index].descriptor, WHOLE)),
+                Source::Gpu(gpu) => {
+                    let [x, y, width, height] = gpu.area;
+                    let [left, top, right, bottom] = gpu.bounds;
+                    Some((self.gpu_sets[self.frame][index], [x, y, width, height, left, top, right, bottom]))
+                }
+            };
+            let places = place(self.extent.width, self.extent.height, self.arrangement, self.integer, self.stereo, right);
+            for (viewport, shown) in places {
+                let index = match shown {
+                    Shown::Top | Shown::Both => 0,
+                    Shown::Bottom => 1,
+                    Shown::Right => 2,
+                };
+                let Some((descriptor, area)) = crop(index) else { continue };
+                let mut constants: Vec<u8> = area.iter().flat_map(|c| c.to_le_bytes()).collect();
+                constants.extend_from_slice(&self.filter.mode().to_le_bytes());
+                let (pipeline, layout, set) = if shown == Shown::Both {
+                    // then how the eyes show, and the right eye's place
+                    let Some((_, right)) = crop(2) else { continue };
+                    let stereo = if self.stereo.mode == StereoMode::Anaglyph { 1i32 } else { 2 };
+                    for word in [stereo, self.stereo.swap as i32, 0] {
+                        constants.extend_from_slice(&word.to_le_bytes());
                     }
+                    constants.extend(right.iter().flat_map(|c| c.to_le_bytes()));
+                    (self.stereo_pipeline, self.stereo_pipeline_layout, self.stereo_sets[self.frame])
+                } else {
+                    (self.pipeline, self.pipeline_layout, descriptor)
                 };
                 set_viewport(device, command_buffer, viewport, self.extent);
-                device.cmd_bind_descriptor_sets(
-                    command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.pipeline_layout,
-                    0,
-                    &[descriptor],
-                    &[],
-                );
-                let mut constants: Vec<u8> = crop.iter().flat_map(|c| c.to_le_bytes()).collect();
-                constants.extend_from_slice(&self.filter.mode().to_le_bytes());
-                device.cmd_push_constants(command_buffer, self.pipeline_layout, vk::ShaderStageFlags::FRAGMENT, 0, &constants);
+                device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                device.cmd_bind_descriptor_sets(command_buffer, vk::PipelineBindPoint::GRAPHICS, layout, 0, &[set], &[]);
+                device.cmd_push_constants(command_buffer, layout, vk::ShaderStageFlags::FRAGMENT, 0, &constants);
                 device.cmd_draw(command_buffer, 3, 1, 0, 0);
             }
 
@@ -747,6 +820,7 @@ impl Presenter for VulkanPresenter {
         &mut self,
         top: ScreenImage<'_>,
         bottom: ScreenImage<'_>,
+        right: ScreenImage<'_>,
         overlay: &Overlay,
     ) -> Result<(), PresentError> {
         if self.stale {
@@ -808,7 +882,12 @@ impl Presenter for VulkanPresenter {
         for screen in &mut self.screens {
             screen.dirty = false;
         }
-        let sources = [self.source(0, &top)?, self.source(1, &bottom)?];
+        // the right eye's picture shows only in a frame that has one
+        let has_right = !right.is_empty();
+        let sources = [self.source(0, &top)?, self.source(1, &bottom)?, self.source(2, &right)?];
+        if has_right && matches!(self.stereo.mode, StereoMode::Anaglyph | StereoMode::Interlaced) {
+            self.write_stereo_set(&sources);
+        }
 
         let command_buffer = self.command_buffers[frame];
         unsafe {
@@ -820,7 +899,7 @@ impl Presenter for VulkanPresenter {
         // both being borrowed
         let mut painter = self.overlay.take().expect("the overlay painter lives as long as the presenter");
         painter.begin_frame(&self.device, frame);
-        let recorded = self.record(command_buffer, self.framebuffers[image_index as usize], &mut painter, overlay, sources);
+        let recorded = self.record(command_buffer, self.framebuffers[image_index as usize], &mut painter, overlay, sources, has_right);
         painter.free(frame, overlay);
         self.overlay = Some(painter);
         recorded?;
@@ -883,13 +962,17 @@ impl Presenter for VulkanPresenter {
         self.filter = filter;
         self.integer = integer;
     }
+
+    fn set_stereo(&mut self, stereo: Stereo) {
+        self.stereo = stereo;
+    }
 }
 
 impl Drop for VulkanPresenter {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
-            for screen in std::mem::replace(&mut self.screens, [Screen::null(), Screen::null()]) {
+            for screen in std::mem::replace(&mut self.screens, [Screen::null(), Screen::null(), Screen::null()]) {
                 screen.destroy(&self.device, self.descriptor_pool);
             }
             self.destroy_swapchain_resources();
@@ -912,6 +995,9 @@ impl Drop for VulkanPresenter {
             self.device.destroy_sampler(self.sampler, None);
             self.device.destroy_pipeline(self.pipeline, None);
             self.device.destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device.destroy_pipeline(self.stereo_pipeline, None);
+            self.device.destroy_pipeline_layout(self.stereo_pipeline_layout, None);
+            self.device.destroy_descriptor_set_layout(self.stereo_layout, None);
             self.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
             self.device
@@ -1042,14 +1128,21 @@ fn create_render_pass(
     .map_err(vk_fail("creating the render pass"))
 }
 
+/// a set of pictures the fragment shader samples, one or the top screen's
+/// two for 3D.
 fn create_descriptor_layout(
     device: &ash::Device,
+    pictures: u32,
 ) -> Result<vk::DescriptorSetLayout, PresentError> {
-    let bindings = [vk::DescriptorSetLayoutBinding::default()
-        .binding(0)
-        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .descriptor_count(1)
-        .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+    let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..pictures)
+        .map(|binding| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(binding)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+        })
+        .collect();
     unsafe {
         device.create_descriptor_set_layout(
             &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
@@ -1063,15 +1156,16 @@ fn create_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
     descriptor_layout: vk::DescriptorSetLayout,
+    fragment_spirv: &[u8],
+    constants_size: u32,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline), PresentError> {
     let vertex = create_shader_module(device, VERTEX_SPIRV)?;
-    let fragment = create_shader_module(device, FRAGMENT_SPIRV)?;
+    let fragment = create_shader_module(device, fragment_spirv)?;
 
     let layouts = [descriptor_layout];
-    // where the screen lies in the image and the bounds its samples keep in
     let constants = [vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-        .size((size_of_val(&WHOLE) + size_of::<i32>()) as u32)];
+        .size(constants_size)];
     let pipeline_layout = unsafe {
         device.create_pipeline_layout(
             &vk::PipelineLayoutCreateInfo::default()
