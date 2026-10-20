@@ -1477,8 +1477,13 @@ pub struct Hardware {
     name: String,
     /// how many times the console's resolution surfaces are drawn at.
     scale: u32,
-    /// whether the GPU can blit both surface formats, which scaling needs.
+    /// whether the GPU can blit the color format, which scaling needs.
     blits: bool,
+    /// whether it can blit the depth format too. Intel's drivers for
+    /// Windows can't blit into it, so there a depth buffer is scaled on the
+    /// CPU on its way to and from memory, which is rare, and it has no image
+    /// at the console's resolution.
+    depth_blits: bool,
     timing: Option<Timing>,
     barriers: u64,
     /// whether anything that writes memory was recorded since the last
@@ -1585,10 +1590,17 @@ impl Hardware {
                 mapped: std::ptr::null_mut(),
                 incoherent: false,
             };
-            let blits = [COLOR_FORMAT, DEPTH_FORMAT].iter().all(|&format| {
+            let blits_into = |format| {
                 let features = instance.get_physical_device_format_properties(physical, format).optimal_tiling_features;
                 features.contains(vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST)
-            });
+            };
+            let blits = blits_into(COLOR_FORMAT);
+            // ZAKURO_DEPTH_BLITS=0 scales depth buffers the other way all the
+            // same, to tell the two apart
+            let depth_blits = blits_into(DEPTH_FORMAT) && std::env::var("ZAKURO_DEPTH_BLITS").map_or(true, |v| v != "0");
+            if !depth_blits {
+                log::info!("the GPU can't blit depth buffers, they are scaled on the CPU on their way to and from memory");
+            }
             let timestamps = instance.get_physical_device_queue_family_properties(physical)[family as usize].timestamp_valid_bits > 0;
             // the driver checks the data is for this GPU and ignores it if not
             let saved = kept_pipelines.as_deref().and_then(read_pipeline_cache).unwrap_or_default();
@@ -1694,6 +1706,7 @@ impl Hardware {
                 name,
                 scale: 1,
                 blits,
+                depth_blits,
                 // the queue has to count time for timestamps to mean anything
                 timing: (std::env::var_os("ZAKURO_GPU_TIMES").is_some() && timestamps).then(|| Timing {
                         period: properties.limits.timestamp_period as f64,
@@ -2306,6 +2319,8 @@ impl Hardware {
                 let image = self.image(width * self.scale, height * self.scale, format, usage, aspect)?;
                 let native = match self.scale {
                     1 => None,
+                    // scaled on the CPU on its way to and from memory
+                    _ if matches!(kind, Kind::Depth(_)) && !self.depth_blits => None,
                     _ => {
                         let usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
                         Some(self.image(width, height, format, usage, aspect)?)
@@ -2474,6 +2489,9 @@ impl Hardware {
     /// copies a guest buffer's bytes into its surface.
     fn upload(&mut self, index: usize, bytes: &[u8]) -> Result<(), String> {
         self.end_rendering();
+        // what drew into or cleared the surface's image in this batch comes
+        // first, the copy can go straight into the image it draws in
+        self.barrier();
         self.mark(Work::Upload, false);
         let (width, height, kind, tiled) = {
             let s = &self.surfaces[index];
@@ -2509,8 +2527,6 @@ impl Hardware {
                 };
             }
             Kind::Depth(sample) => {
-                let depths = self.stage(pixels * 4, 16)?;
-                let stencils = self.stage(pixels, 16)?;
                 let mut values = vec![0u32; pixels as usize];
                 let mut stencil = vec![0u8; pixels as usize];
                 for y in 0..height {
@@ -2531,17 +2547,48 @@ impl Hardware {
                         }
                     }
                 }
-                let staging = self.ring(depths, pixels * 4);
-                for (out, value) in staging.as_chunks_mut::<4>().0.iter_mut().zip(&values) {
-                    *out = value.to_le_bytes();
+                // a depth buffer with no image at the console's resolution
+                // goes straight to its scaled one, scaled here the way a blit
+                // up scales, through a buffer of its own when that is more
+                // than the ring takes
+                let n = if self.surfaces[index].native.is_some() { 1 } else { self.scale };
+                if n > 1 {
+                    values = scale_up(&values, width, height, n);
+                    stencil = scale_up(&stencil, width, height, n);
                 }
-                self.ring(stencils, pixels).copy_from_slice(&stencil);
-                let regions = [region(depths, vk::ImageAspectFlags::DEPTH), region(stencils, vk::ImageAspectFlags::STENCIL)];
-                // SAFETY: as above
+                let texels = values.len() as u64;
+                let in_ring = n == 1 || (texels * 5 <= RING_PICTURE && self.used + texels * 5 + 16 <= RING_FLUSH);
+                let (buffer, depths, staging) = if in_ring {
+                    (self.ring.buffer, self.stage(texels * 5, 16)?, None)
+                } else {
+                    let staging = self.buffer(texels * 5, vk::BufferUsageFlags::TRANSFER_SRC, false)?;
+                    (staging.buffer, 0, Some(staging))
+                };
+                let stencils = depths + texels * 4;
+                let out = match &staging {
+                    Some(staging) => {
+                        // SAFETY: the buffer is mapped for its whole size,
+                        // texels * 5 bytes, and the GPU has not seen it yet
+                        unsafe { std::slice::from_raw_parts_mut(staging.mapped, (texels * 5) as usize) }
+                    }
+                    None => self.ring(depths, texels * 5),
+                };
+                let (words, bytes) = out.split_at_mut((texels * 4) as usize);
+                for (word, value) in words.as_chunks_mut::<4>().0.iter_mut().zip(&values) {
+                    *word = value.to_le_bytes();
+                }
+                bytes.copy_from_slice(&stencil);
+                let extent = vk::Extent3D { width: width * n, height: height * n, depth: 1 };
+                let regions = [region(depths, vk::ImageAspectFlags::DEPTH).image_extent(extent), region(stencils, vk::ImageAspectFlags::STENCIL).image_extent(extent)];
+                // SAFETY: as above, the regions lie inside the ring or the
+                // buffer made for them
                 unsafe {
                     self.unfenced = true;
-                    self.device.cmd_copy_buffer_to_image(self.commands, self.ring.buffer, image, vk::ImageLayout::GENERAL, &regions)
+                    self.device.cmd_copy_buffer_to_image(self.commands, buffer, image, vk::ImageLayout::GENERAL, &regions)
                 };
+                if let Some(staging) = staging {
+                    self.staged.push((self.batch, staging));
+                }
             }
         }
         if self.scale > 1 {
@@ -2557,6 +2604,8 @@ impl Hardware {
 
     /// records a blit between a scaled surface and its image at the
     /// console's resolution, up or down, taking the nearest pixel either way.
+    /// a surface with no such image, a depth buffer on a GPU that can't blit
+    /// them, is scaled on the CPU instead, see scale_up and scale_down_depth.
     fn blit(&mut self, index: usize, up: bool) {
         let s = &self.surfaces[index];
         let Some(native) = &s.native else { return };
@@ -5002,9 +5051,13 @@ impl Hardware {
         self.end_rendering();
 
         // room for every surface to write back, colors as RGBA, depth as a
-        // word and stencil as a byte per sample
+        // word and stencil as a byte per sample. one with no image at the
+        // console's resolution, a depth buffer on a GPU that can't blit them,
+        // comes back at its scaled size and is scaled down here
+        let scale = self.scale;
+        let factor = move |s: &Surface| if scale > 1 && s.native.is_none() && matches!(s.kind, Kind::Depth(_)) { scale } else { 1 };
         let size_of = |s: &Surface| {
-            let pixels = (s.width * s.height) as u64;
+            let pixels = (s.width * s.height * factor(s) * factor(s)) as u64;
             match s.kind {
                 Kind::Color(_) => pixels * 4,
                 Kind::Depth(_) => pixels * 5,
@@ -5035,14 +5088,15 @@ impl Hardware {
         let mut offset = 0;
         for &i in &dirty {
             let s = &self.surfaces[i];
-            let extent = vk::Extent3D { width: s.width, height: s.height, depth: 1 };
+            let n = factor(s);
+            let extent = vk::Extent3D { width: s.width * n, height: s.height * n, depth: 1 };
             let region = |at: u64, aspect: vk::ImageAspectFlags| {
                 vk::BufferImageCopy::default()
                     .buffer_offset(at)
                     .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(aspect).layer_count(1))
                     .image_extent(extent)
             };
-            let pixels = (s.width * s.height) as u64;
+            let pixels = (s.width * s.height * n * n) as u64;
             let regions: Vec<_> = match s.kind {
                 Kind::Color(_) => vec![region(offset, vk::ImageAspectFlags::COLOR)],
                 Kind::Depth(_) => vec![
@@ -5079,7 +5133,14 @@ impl Hardware {
             // SAFETY: the GPU finished writing the buffer, and the range was
             // sized for this surface
             let data = unsafe { std::slice::from_raw_parts(mapped.add(offset as usize), size_of(&self.surfaces[i]) as usize) };
-            self.store(memory, i, data);
+            match factor(&self.surfaces[i]) {
+                1 => self.store(memory, i, data),
+                n => {
+                    let (width, height) = (self.surfaces[i].width, self.surfaces[i].height);
+                    let data = scale_down_depth(data, width, height, n);
+                    self.store(memory, i, &data);
+                }
+            }
         }
         Ok(())
     }
@@ -5321,6 +5382,43 @@ fn logic_op(op: LogicOp) -> vk::LogicOp {
         LogicOp::OrReverse => vk::LogicOp::OR_REVERSE,
         LogicOp::OrInverted => vk::LogicOp::OR_INVERTED,
     }
+}
+
+/// texels, rows of width, at n times their size each way, each the square
+/// of them that a nearest blit up makes of it.
+fn scale_up<T: Copy>(texels: &[T], width: u32, height: u32, n: u32) -> Vec<T> {
+    let (width, height, n) = (width as usize, height as usize, n as usize);
+    let mut scaled = Vec::with_capacity(texels.len() * n * n);
+    for row in texels.chunks(width).take(height) {
+        let start = scaled.len();
+        scaled.extend(row.iter().flat_map(|&texel| std::iter::repeat_n(texel, n)));
+        for _ in 1..n {
+            scaled.extend_from_within(start..start + width * n);
+        }
+    }
+    scaled
+}
+
+/// a depth buffer read back at n times its size, its words then its
+/// stencil bytes, at its own size, each pixel the one a nearest blit down
+/// takes, the one at the middle of the square it was scaled to. at an even
+/// n the middle falls between two texels, where GPUs' blits pick either
+/// one as their rounding goes, and this takes the one the spec's floor does.
+fn scale_down_depth(data: &[u8], width: u32, height: u32, n: u32) -> Vec<u8> {
+    let (width, height, n) = (width as usize, height as usize, n as usize);
+    let scaled = width * n;
+    let (words, stencil) = data.split_at(width * height * n * n * 4);
+    let mut out = vec![0u8; width * height * 5];
+    let (out_words, out_stencil) = out.split_at_mut(width * height * 4);
+    for y in 0..height {
+        for x in 0..width {
+            let from = (y * n + n / 2) * scaled + x * n + n / 2;
+            let to = y * width + x;
+            out_words[to * 4..to * 4 + 4].copy_from_slice(&words[from * 4..from * 4 + 4]);
+            out_stencil[to] = stencil[from];
+        }
+    }
+    out
 }
 
 /// whether the renderer can draw on a GPU, Vulkan 1.3, push descriptors,
@@ -5645,5 +5743,41 @@ mod tests {
                 assert!(made.contains(&PipelineKey { fragment: generic(&key.fragment), ..key }));
             }
         }
+    }
+
+    /// a depth buffer scaled up and then down the way blits would comes back
+    /// the same, and going down takes the middle of each square, the pixel
+    /// a nearest blit takes.
+    #[test]
+    fn depth_scaled_up_and_down_comes_back_the_same() {
+        let (width, height) = (5u32, 3u32);
+        let words: Vec<u32> = (0..width * height).map(|i| 0x0100_0000 * (i % 3) + i * 0x1111).collect();
+        let stencil: Vec<u8> = (0..width * height).map(|i| (i * 7) as u8).collect();
+        for n in 1..=8 {
+            let (up_words, up_stencil) = (scale_up(&words, width, height, n), scale_up(&stencil, width, height, n));
+            assert_eq!(up_words.len(), (width * height * n * n) as usize);
+            // each texel fills its square of n by n
+            let scaled = (width * n) as usize;
+            for (i, &word) in up_words.iter().enumerate() {
+                let (x, y) = ((i % scaled) / n as usize, (i / scaled) / n as usize);
+                assert_eq!(word, words[y * width as usize + x], "n {n}, texel {i}");
+            }
+            let mut data: Vec<u8> = up_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            data.extend_from_slice(&up_stencil);
+            let mut expected: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            expected.extend_from_slice(&stencil);
+            assert_eq!(scale_down_depth(&data, width, height, n), expected, "n {n}");
+        }
+        // down, the middle of each square: x * n + n / 2, 4 * 3 + 2 at 4x
+        let n = 4;
+        let mut data = vec![0u8; (width * height * n * n * 5) as usize];
+        let scaled = width * n;
+        let at = (2 * n + n / 2) * scaled + 3 * n + n / 2;
+        data[(at * 4) as usize..(at * 4 + 4) as usize].copy_from_slice(&0xABCDEFu32.to_le_bytes());
+        data[(width * height * n * n * 4 + at) as usize] = 0x5A;
+        let down = scale_down_depth(&data, width, height, n);
+        let to = (2 * width + 3) as usize;
+        assert_eq!(&down[to * 4..to * 4 + 4], &0xABCDEFu32.to_le_bytes());
+        assert_eq!(down[(width * height) as usize * 4 + to], 0x5A);
     }
 }
