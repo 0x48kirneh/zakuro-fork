@@ -70,7 +70,9 @@ fn component_size(ty: u32) -> u32 {
     }
 }
 
-/// one component of an attribute, from its bytes.
+/// one component of an attribute, from its bytes, the way LoaderPlan::place
+/// reads them.
+#[cfg(test)]
 fn component(bytes: &[u8], ty: u32) -> f32 {
     match ty {
         0 => bytes[0] as i8 as f32,
@@ -257,11 +259,19 @@ impl LoaderPlan {
     /// texture coordinate arrives as (u, v, 0, 1).
     fn place(&self, bytes: &[u8], input: &mut [Vec4; shader::INPUT_REGISTERS]) {
         for field in &self.fields {
-            let size = component_size(field.ty) as usize;
+            // the type once a field rather than once a component, as
+            // component reads it
+            let (at, count) = (field.offset as usize, field.count as usize);
             let mut value = [0.0f32, 0.0, 0.0, 1.0];
-            for (i, slot) in value.iter_mut().enumerate().take(field.count as usize) {
-                let at = field.offset as usize + i * size;
-                *slot = component(&bytes[at..at + size], field.ty);
+            let slots = value.iter_mut().enumerate().take(count);
+            match field.ty {
+                0 => slots.for_each(|(i, slot)| *slot = bytes[at + i] as i8 as f32),
+                1 => slots.for_each(|(i, slot)| *slot = bytes[at + i] as f32),
+                2 => slots.for_each(|(i, slot)| *slot = i16::from_le_bytes([bytes[at + i * 2], bytes[at + i * 2 + 1]]) as f32),
+                _ => slots.for_each(|(i, slot)| {
+                    let word = &bytes[at + i * 4..at + i * 4 + 4];
+                    *slot = f32::from_bits(u32::from_le_bytes([word[0], word[1], word[2], word[3]]));
+                }),
             }
             input[field.register] = value;
         }
@@ -2700,6 +2710,44 @@ mod tests {
     fn vertex_bits(vertex: &Vertex) -> Vec<u32> {
         let texcoords = vertex.texcoords.as_flattened();
         [&vertex.clip[..], &vertex.color, texcoords, &vertex.quaternion, &vertex.view].concat().iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// placing a vertex's fields gives the bits reading each component
+    /// does, for every type and count.
+    #[test]
+    fn placing_fields_reads_what_each_component_does() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for case in 0..20_000 {
+            let bytes: Vec<u8> = (0..64).map(|_| next() as u8).collect();
+            let mut fields = Vec::new();
+            let mut offset = 0u32;
+            for register in 0..(1 + next() % 4) as usize {
+                let (ty, count) = (next() % 4, 1 + next() % 4);
+                let size = component_size(ty);
+                offset = offset.next_multiple_of(size);
+                fields.push(PlacedField { offset, ty, count, register: register * 3 % shader::INPUT_REGISTERS });
+                offset += size * count;
+            }
+            let loader = LoaderPlan { index: 0, offset: 0, stride: offset, size: offset, fields };
+            let mut placed = [[f32::from_bits(next()); 4]; shader::INPUT_REGISTERS];
+            let mut expected = placed;
+            loader.place(&bytes, &mut placed);
+            for field in &loader.fields {
+                let size = component_size(field.ty) as usize;
+                let mut value = [0.0f32, 0.0, 0.0, 1.0];
+                for (i, slot) in value.iter_mut().enumerate().take(field.count as usize) {
+                    let at = field.offset as usize + i * size;
+                    *slot = component(&bytes[at..at + size], field.ty);
+                }
+                expected[field.register] = value;
+            }
+            let bits = |input: &[Vec4; shader::INPUT_REGISTERS]| input.as_flattened().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&placed), bits(&expected), "case {case}");
+        }
     }
 
     /// a plan gives the same bits as packing the outputs and picking the

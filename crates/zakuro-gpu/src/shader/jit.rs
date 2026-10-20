@@ -74,8 +74,18 @@ impl Context {
     /// the inputs the program reads into rows, lanes past the last vertex
     /// repeating it, so that they branch its way.
     fn fill(&mut self, read: u16, inputs: &[[Vec4; INPUT_REGISTERS]]) {
+        // a whole batch, as nearly all are, reads its lanes without
+        // checking each one against the last
+        if let Ok(full) = <&[[Vec4; INPUT_REGISTERS]; LANES]>::try_from(inputs) {
+            for register in registers(read) {
+                for (component, row) in self.inputs[register].iter_mut().enumerate() {
+                    *row = std::array::from_fn(|lane| full[lane][register][component]);
+                }
+            }
+            return;
+        }
         let last = inputs.len() - 1;
-        for register in (0..INPUT_REGISTERS).filter(|register| read & (1 << register) != 0) {
+        for register in registers(read) {
             for (component, row) in self.inputs[register].iter_mut().enumerate() {
                 *row = std::array::from_fn(|lane| inputs[lane.min(last)][register][component]);
             }
@@ -84,12 +94,29 @@ impl Context {
 
     /// the outputs the program writes out of rows, for the vertices there are.
     fn drain(&self, written: u16, outputs: &mut [[Vec4; OUTPUT_REGISTERS]]) {
-        for register in (0..OUTPUT_REGISTERS).filter(|register| written & (1 << register) != 0) {
+        if let Ok(full) = <&mut [[Vec4; OUTPUT_REGISTERS]; LANES]>::try_from(&mut *outputs) {
+            for register in registers(written) {
+                for (lane, output) in full.iter_mut().enumerate() {
+                    output[register] = std::array::from_fn(|component| self.outputs[register][component][lane]);
+                }
+            }
+            return;
+        }
+        for register in registers(written) {
             for (lane, output) in outputs.iter_mut().enumerate() {
                 output[register] = std::array::from_fn(|component| self.outputs[register][component][lane]);
             }
         }
     }
+}
+
+/// the registers a mask has, lowest first.
+fn registers(mut mask: u16) -> impl Iterator<Item = usize> {
+    std::iter::from_fn(move || {
+        let register = (mask != 0).then(|| mask.trailing_zeros() as usize)?;
+        mask &= mask - 1;
+        Some(register)
+    })
 }
 
 /// what the lanes of a geometry shader emit, the way batch's emitters keep
