@@ -2,7 +2,10 @@
 //! them in, cheats/<title id>.txt in the data folder, so that one made for
 //! them works here as it is. the cheats that are on run once a frame.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
 
 use zakuro_common::memory_map::PAGE_SIZE;
 use zakuro_cpu::Bus;
@@ -22,6 +25,18 @@ pub struct Cheat {
     /// one of Zakuro's enhancements rather than the player's, which stays
     /// out of the cheat file.
     pub builtin: bool,
+    /// what an enhancement's code overwrote, by address, put back once it
+    /// is turned off. a player's cheat keeps what it wrote, as in Citra: the
+    /// money a cheat gave stays.
+    pub(crate) overwrote: BTreeMap<u32, Overwrote>,
+}
+
+/// a byte an enhancement changed: what it held before the enhancement
+/// first wrote it, and what the enhancement wrote last.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Overwrote {
+    pub original: u8,
+    pub wrote: u8,
 }
 
 /// a line of code taken apart, its type being its first digit, or its first
@@ -64,7 +79,7 @@ pub fn is_code(line: &str) -> bool {
 impl Cheat {
     pub fn new(name: &str, lines: Vec<String>, notes: Vec<String>) -> Cheat {
         let code = lines.iter().map(|line| Line::parse(line)).collect();
-        Cheat { name: name.to_owned(), enabled: false, notes, lines, code, builtin: false }
+        Cheat { name: name.to_owned(), enabled: false, notes, lines, code, builtin: false, overwrote: BTreeMap::new() }
     }
 
     pub fn lines(&self) -> &[String] {
@@ -164,6 +179,8 @@ struct CodeRanges {
     /// what the cheats changed of them, the text and the modules by index.
     text_changed: bool,
     modules_changed: Vec<usize>,
+    /// what the enhancement running overwrote, none for a player's cheat.
+    overwrote: Option<BTreeMap<u32, Overwrote>>,
 }
 
 impl CodeRanges {
@@ -173,7 +190,7 @@ impl CodeRanges {
             (text.address, text.address + text.num_pages * PAGE_SIZE)
         });
         let modules = system.cro.modules.iter().map(|module| (module.base, module.base + module.size)).collect();
-        CodeRanges { text, modules, text_changed: false, modules_changed: Vec::new() }
+        CodeRanges { text, modules, text_changed: false, modules_changed: Vec::new(), overwrote: None }
     }
 
     fn wrote(&mut self, addr: u32) {
@@ -188,20 +205,33 @@ impl CodeRanges {
     }
 }
 
-/// runs the cheats that are on, once a frame. a cheat that changes code has
+/// runs the cheats that are on, once a frame, and puts back what an
+/// enhancement turned off had overwritten. a cheat that changes code has
 /// what was recompiled of it checked again, so that the interpreter runs the
-/// functions it changed.
+/// functions it changed, and the recompiled code those put back.
 pub fn run(system: &mut System) {
-    if !system.cheats.iter().any(|cheat| cheat.enabled) {
+    if !system.cheats.iter().any(|cheat| cheat.enabled || !cheat.overwrote.is_empty()) {
         return;
     }
     let mut ranges = CodeRanges::of(system);
     let pad = system.services.hid.previous.bits();
     for index in 0..system.cheats.len() {
-        if system.cheats[index].enabled {
-            let code = std::mem::take(&mut system.cheats[index].code);
+        let cheat = &mut system.cheats[index];
+        if !cheat.enabled && !cheat.overwrote.is_empty() {
+            let overwrote = std::mem::take(&mut cheat.overwrote);
+            log::info!("enhancement {} is off, {} bytes it changed go back", cheat.name, overwrote.len());
+            restore(system, &mut ranges, overwrote);
+        }
+        let cheat = &mut system.cheats[index];
+        if cheat.enabled {
+            let code = std::mem::take(&mut cheat.code);
+            ranges.overwrote = cheat.builtin.then(|| std::mem::take(&mut cheat.overwrote));
             execute(system, &code, pad, &mut ranges);
-            system.cheats[index].code = code;
+            let cheat = &mut system.cheats[index];
+            cheat.code = code;
+            if let Some(overwrote) = ranges.overwrote.take() {
+                cheat.overwrote = overwrote;
+            }
         }
     }
     if let Some(library) = system.recompiled.as_mut() {
@@ -214,6 +244,16 @@ pub fn run(system: &mut System) {
         for index in ranges.modules_changed {
             let module = &system.cro.modules[index];
             library.place(&module.name, module.base, &mut system.memory);
+        }
+    }
+}
+
+/// writes back the bytes an enhancement overwrote, where memory still
+/// holds what it wrote, so that what the game changed since stays.
+fn restore(system: &mut System, ranges: &mut CodeRanges, overwrote: BTreeMap<u32, Overwrote>) {
+    for (addr, Overwrote { original, wrote }) in overwrote {
+        if mapped(system, addr, 1) && system.memory.read8(addr) == wrote {
+            write(system, ranges, addr, 1, original as u32);
         }
     }
 }
@@ -238,6 +278,13 @@ fn read(system: &mut System, addr: u32, size: u32) -> u32 {
 fn write(system: &mut System, ranges: &mut CodeRanges, addr: u32, size: u32, value: u32) {
     if !mapped(system, addr, size) || read(system, addr, size) == value & (u32::MAX >> (32 - size * 8)) {
         return;
+    }
+    if let Some(overwrote) = ranges.overwrote.as_mut() {
+        for (i, byte) in value.to_le_bytes().into_iter().take(size as usize).enumerate() {
+            let at = addr.wrapping_add(i as u32);
+            let original = system.memory.read8(at);
+            overwrote.entry(at).or_insert(Overwrote { original, wrote: byte }).wrote = byte;
+        }
     }
     let writable = system.memory.mapping_at(addr).is_some_and(|mapping| mapping.permission.contains(crate::memory::Permission::WRITE));
     match size {
@@ -425,6 +472,39 @@ mod tests {
         system.memory.read_bytes(0x0010_0050, &mut memory[..1]);
         assert_eq!(memory[0], 0xCC, "A is held");
         std::fs::remove_file(rom).unwrap();
+    }
+
+    /// an enhancement turned off puts back what it overwrote, but not a
+    /// byte the game changed since, and a player's cheat keeps what it wrote.
+    #[test]
+    fn an_enhancement_turned_off_puts_back_what_it_overwrote() {
+        use crate::memory::{MemoryRegion, MemoryState, Permission};
+        let (mut system, _) = crate::services::tests::system_with_thread();
+        let page = system.memory.phys.allocate(MemoryRegion::Application, 0x1000).unwrap();
+        system.memory.map(0x0800_0000, page.addr, 0x1000, Permission::RW, MemoryState::Private);
+        system.memory.write_bytes(0x0800_0010, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut enhancement = Cheat::new("60 FPS", vec!["08000010 AABBCCDD".into(), "28000015 00000066".into()], Vec::new());
+        enhancement.builtin = true;
+        enhancement.enabled = true;
+        let mut cheat = Cheat::new("Money", vec!["28000017 00000077".into()], Vec::new());
+        cheat.enabled = true;
+        system.cheats = vec![enhancement, cheat];
+        run(&mut system);
+        run(&mut system);
+        let mut memory = [0; 8];
+        system.memory.read_bytes(0x0800_0010, &mut memory);
+        assert_eq!(memory, [0xDD, 0xCC, 0xBB, 0xAA, 5, 0x66, 7, 0x77]);
+        assert!(system.cheats[1].overwrote.is_empty(), "a player's cheat remembers nothing");
+
+        for cheat in &mut system.cheats {
+            cheat.enabled = false;
+        }
+        // the game wrote one of the enhancement's bytes in the meantime
+        system.memory.write_bytes(0x0800_0011, &[0x99]);
+        run(&mut system);
+        system.memory.read_bytes(0x0800_0010, &mut memory);
+        assert_eq!(memory, [1, 0x99, 3, 4, 5, 6, 7, 0x77]);
+        assert!(system.cheats[0].overwrote.is_empty());
     }
 
     #[test]

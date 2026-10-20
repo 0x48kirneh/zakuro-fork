@@ -86,6 +86,16 @@ fn main() {
         system.enable_profiler();
     }
 
+    // ZAKURO_ENHANCE="60 FPS" turns on the game's enhancements of those
+    // names, separated by commas, and ZAKURO_ENHANCE_OFF_AT=frame turns them
+    // all off there, as a player does in the cheats window
+    let enhance = std::env::var("ZAKURO_ENHANCE").unwrap_or_default();
+    for cheat in system.cheats.iter_mut().filter(|cheat| cheat.builtin && enhance.split(',').any(|name| name.trim() == cheat.name)) {
+        cheat.enabled = true;
+        println!("enhancement {} on", cheat.name);
+    }
+    let enhance_off_at: Option<u64> = std::env::var("ZAKURO_ENHANCE_OFF_AT").ok().and_then(|f| f.parse().ok());
+
     // ZAKURO_ROOM_HOST=port opens a room and joins it, ZAKURO_ROOM=host:port
     // joins one, under ZAKURO_NICK, for local wireless with another run
     let _server = std::env::var("ZAKURO_ROOM_HOST").ok().and_then(|port| port.parse().ok()).map(|port| {
@@ -204,6 +214,12 @@ fn main() {
     });
     let mut frame = first;
     while frame < frames {
+        if enhance_off_at == Some(frame) {
+            for cheat in system.cheats.iter_mut().filter(|cheat| cheat.builtin && cheat.enabled) {
+                cheat.enabled = false;
+                println!("frame {frame}: enhancement {} off", cheat.name);
+            }
+        }
         if let Some((_, file)) = load_at.take_if(|(at, _)| *at == frame) {
             match std::fs::read(&file).map_err(|error| error.to_string()).and_then(|bytes| system.load_state(&bytes)) {
                 Ok(()) => {
