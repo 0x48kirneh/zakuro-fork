@@ -486,30 +486,69 @@ fn pack_outputs(outputs: &[Vec4; shader::OUTPUT_REGISTERS], mask: u32) -> [Vec4;
     packed
 }
 
-/// picks the rasterizer's varyings out of a vertex's output attributes.
-fn to_vertex(map: &OutputMap, attributes: &[Vec4; 16]) -> Vertex {
-    let get = |slot: (usize, usize)| attributes[slot.0][slot.1];
-    // a shader that writes no color means "use white", not "use whatever
-    // happened to be in that register", an untextured draw should come out
-    // lit rather than black, and a textured one unmodulated.
-    let color_or = |slot: Option<(usize, usize)>| slot.map_or(1.0, get);
+/// where each of a vertex's 21 values comes from in a stage's output
+/// registers, worked out once a draw from the output map and the stage's
+/// output mask: what packing the outputs and picking the varyings out of
+/// them gives, without packing every vertex.
+#[derive(Clone, Copy)]
+struct VertexPlan {
+    /// the output register times four plus the component, or PLAN_ZERO or
+    /// PLAN_ONE, in the order of clip, color, texcoords, quaternion and view.
+    from: [u8; 21],
+}
 
-    Vertex {
-        clip: [
-            get(map.position[0]),
-            get(map.position[1]),
-            get(map.position[2]),
-            get(map.position[3]),
-        ],
-        color: [
-            color_or(map.color[0]),
-            color_or(map.color[1]),
-            color_or(map.color[2]),
-            color_or(map.color[3]),
-        ],
-        texcoords: map.texcoords.map(|set| [set[0].map_or(0.0, get), set[1].map_or(0.0, get)]),
-        quaternion: map.quaternion.map(|slot| slot.map_or(0.0, get)),
-        view: map.view.map(|slot| slot.map_or(0.0, get)),
+/// a value that no output register gives.
+const PLAN_ZERO: u8 = 64;
+/// a color that no output register gives: a shader that writes no color
+/// means "use white", not "use whatever happened to be in that register",
+/// an untextured draw should come out lit rather than black, and a textured
+/// one unmodulated.
+const PLAN_ONE: u8 = 65;
+
+impl VertexPlan {
+    fn new(map: &OutputMap, mask: u32) -> VertexPlan {
+        // the output register behind each attribute, as pack_outputs packs
+        // them: a mask of zero takes the registers as they are
+        let mut registers = [None; shader::OUTPUT_REGISTERS];
+        let enabled = (0..shader::OUTPUT_REGISTERS).filter(|register| mask & 0xFFFF == 0 || mask & (1 << register) != 0);
+        for (slot, register) in enabled.enumerate() {
+            registers[slot] = Some(register);
+        }
+        // an attribute past the enabled registers is packed as zero
+        let read = |(attribute, component): (usize, usize)| registers[attribute].map_or(PLAN_ZERO, |register| (register * 4 + component) as u8);
+        let or = |slot: Option<(usize, usize)>, missing: u8| slot.map_or(missing, read);
+        let mut from = [PLAN_ZERO; 21];
+        for i in 0..4 {
+            from[i] = read(map.position[i]);
+            from[4 + i] = or(map.color[i], PLAN_ONE);
+            from[14 + i] = or(map.quaternion[i], PLAN_ZERO);
+        }
+        for (set, coordinates) in map.texcoords.iter().enumerate() {
+            for (i, &slot) in coordinates.iter().enumerate() {
+                from[8 + set * 2 + i] = or(slot, PLAN_ZERO);
+            }
+        }
+        for (i, &slot) in map.view.iter().enumerate() {
+            from[18 + i] = or(slot, PLAN_ZERO);
+        }
+        VertexPlan { from }
+    }
+
+    /// picks the rasterizer's varyings out of a vertex's output registers.
+    fn vertex(&self, outputs: &[Vec4; shader::OUTPUT_REGISTERS]) -> Vertex {
+        let outputs = outputs.as_flattened();
+        let get = |i: usize| match self.from[i] {
+            PLAN_ZERO => 0.0,
+            PLAN_ONE => 1.0,
+            from => outputs[from as usize],
+        };
+        Vertex {
+            clip: [get(0), get(1), get(2), get(3)],
+            color: [get(4), get(5), get(6), get(7)],
+            texcoords: [[get(8), get(9)], [get(10), get(11)], [get(12), get(13)]],
+            quaternion: [get(14), get(15), get(16), get(17)],
+            view: [get(18), get(19), get(20)],
+        }
     }
 }
 
@@ -550,8 +589,8 @@ fn process_vertices<'a>(
         return (geometry_stage(registers, geometry_shader, &map, outputs), None);
     }
     // each vertex made once, by the threads that shade it
-    let mask = registers[REG_VS_OUTPUT_MASK];
-    let vertices = shade_with(vertex_shader, inputs, |outputs| to_vertex(&map, &pack_outputs(&outputs, mask)));
+    let plan = VertexPlan::new(&map, registers[REG_VS_OUTPUT_MASK]);
+    let vertices = shade_with(vertex_shader, inputs, |outputs| plan.vertex(&outputs));
     (vertices, order)
 }
 
@@ -735,6 +774,7 @@ fn geometry_stage(
         invocations.par_chunks(PARALLEL_CHUNK / 4).flat_map_iter(|chunk| shader::run_geometry_many(unit, chunk)).collect()
     };
 
+    let plan = VertexPlan::new(map, output_mask);
     let mut vertices = Vec::new();
     for (input, triangles) in invocations.iter().zip(&emitted) {
         if vertices.is_empty() && log::log_enabled!(log::Level::Trace) {
@@ -757,7 +797,7 @@ fn geometry_stage(
         }
         for triangle in triangles {
             for outputs in triangle {
-                vertices.push(to_vertex(map, &pack_outputs(outputs, output_mask)));
+                vertices.push(plan.vertex(outputs));
             }
         }
     }
@@ -2642,6 +2682,60 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// the varyings picked out of packed attributes one by one, the way
+    /// they were before VertexPlan.
+    fn picked_vertex(map: &OutputMap, attributes: &[Vec4; 16]) -> Vertex {
+        let get = |slot: (usize, usize)| attributes[slot.0][slot.1];
+        let color_or = |slot: Option<(usize, usize)>| slot.map_or(1.0, get);
+        Vertex {
+            clip: map.position.map(get),
+            color: map.color.map(color_or),
+            texcoords: map.texcoords.map(|set| [set[0].map_or(0.0, get), set[1].map_or(0.0, get)]),
+            quaternion: map.quaternion.map(|slot| slot.map_or(0.0, get)),
+            view: map.view.map(|slot| slot.map_or(0.0, get)),
+        }
+    }
+
+    fn vertex_bits(vertex: &Vertex) -> Vec<u32> {
+        let texcoords = vertex.texcoords.as_flattened();
+        [&vertex.clip[..], &vertex.color, texcoords, &vertex.quaternion, &vertex.view].concat().iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// a plan gives the same bits as packing the outputs and picking the
+    /// varyings, for any output map and mask, missing values and NaNs too.
+    #[test]
+    fn a_vertex_plan_picks_what_packing_did() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let mut registers = vec![0u32; 0x300];
+        for case in 0..20_000 {
+            registers[REG_SHADER_OUTPUT_TOTAL] = next() % 9;
+            for word in &mut registers[REG_SHADER_OUTPUT_MAP..=REG_SHADER_OUTPUT_MAP_END] {
+                // semantics, the unused 0x1F among them
+                *word = u32::from_le_bytes(std::array::from_fn(|_| [0x1F, (next() % 24) as u8][(next() % 4 != 0) as usize]));
+            }
+            let mask = match case % 4 {
+                0 => 0,
+                1 => 0xFFFF,
+                _ => next() & 0xFFFF,
+            };
+            let map = read_output_map(&registers);
+            let plan = VertexPlan::new(&map, mask);
+            let outputs: [Vec4; shader::OUTPUT_REGISTERS] = std::array::from_fn(|_| {
+                std::array::from_fn(|_| match next() % 8 {
+                    0 => f32::from_bits(0x7FC0_0000 | next() & 0x3F_FFFF),
+                    1 => -0.0,
+                    _ => next() as f32 / 1000.0 - 1000.0,
+                })
+            });
+            let expected = picked_vertex(&map, &pack_outputs(&outputs, mask));
+            assert_eq!(vertex_bits(&plan.vertex(&outputs)), vertex_bits(&expected), "case {case}, mask 0x{mask:04X}, map {map:?}");
+        }
+    }
 
     /// guest memory seen the way the GPU sees it, physical VRAM and FCRAM
     /// translate to different virtual windows. its first megabytes lie in
