@@ -53,6 +53,9 @@ const UPRIGHT_IMAGE_SPIRV: &[u8] = include_bytes!("../../shaders/upright_image.c
 
 const COLOR_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const DEPTH_FORMAT: vk::Format = vk::Format::D24_UNORM_S8_UINT;
+/// the depth format on GPUs that can't draw into DEPTH_FORMAT, AMD's, its
+/// floats standing for the console's 24 bits, see float_depth.
+const FLOAT_DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT_S8_UINT;
 
 /// where a batch keeps its vertices, uniforms and uploads.
 const RING_SIZE: u64 = 64 << 20;
@@ -518,8 +521,8 @@ impl Surface {
 }
 
 /// the format, the uses and the aspects of the image a surface of a kind
-/// draws into.
-fn surface_image(kind: Kind) -> (vk::Format, vk::ImageUsageFlags, vk::ImageAspectFlags) {
+/// draws into, depth buffers in the depth format given.
+fn surface_image(kind: Kind, depth_format: vk::Format) -> (vk::Format, vk::ImageUsageFlags, vk::ImageAspectFlags) {
     let (format, usage, aspect) = match kind {
         Kind::Color(_) => (
             COLOR_FORMAT,
@@ -527,7 +530,7 @@ fn surface_image(kind: Kind) -> (vk::Format, vk::ImageUsageFlags, vk::ImageAspec
             vk::ImageAspectFlags::COLOR,
         ),
         Kind::Depth(_) => (
-            DEPTH_FORMAT,
+            depth_format,
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
             vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
         ),
@@ -1045,6 +1048,7 @@ impl Compiler {
         layout: vk::PipelineLayout,
         fragments: [vk::ShaderModule; 2],
         dynamic: Dynamic,
+        depth_format: vk::Format,
     ) -> Compiler {
         let waiting = Queue {
             translations: VecDeque::new(),
@@ -1062,7 +1066,7 @@ impl Compiler {
                 let (jobs, sent, device, kept) = (queue.clone(), sent.clone(), device.clone(), kept.clone());
                 thread::Builder::new()
                     .name("shader compiler".into())
-                    .spawn(move || compile(&jobs, &sent, &device, cache, kept.as_deref(), layout, fragments, dynamic))
+                    .spawn(move || compile(&jobs, &sent, &device, cache, kept.as_deref(), layout, fragments, dynamic, depth_format))
                     .ok()
             })
             .collect();
@@ -1131,6 +1135,7 @@ fn compile(
     layout: vk::PipelineLayout,
     fragments: [vk::ShaderModule; 2],
     dynamic: Dynamic,
+    depth_format: vk::Format,
 ) {
     let (queue, ready) = jobs;
     let lock = || queue.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1161,7 +1166,7 @@ fn compile(
         };
         drop(waiting);
         let compiles = matches!(job, Job::Compile(..));
-        let made = work(job, device, cache, layout, fragments, dynamic);
+        let made = work(job, device, cache, layout, fragments, dynamic, depth_format);
         lock().compiled += compiles as usize;
         if sent.send(made).is_err() {
             return;
@@ -1178,6 +1183,7 @@ fn work(
     layout: vk::PipelineLayout,
     fragments: [vk::ShaderModule; 2],
     dynamic: Dynamic,
+    depth_format: vk::Format,
 ) -> Made {
     let started = std::time::Instant::now();
     match job {
@@ -1206,7 +1212,7 @@ fn work(
         }
         Job::Compile(key, module) => {
             let modules = [module, fragment_module(fragments, &key)];
-            let made = compile_pipeline(device, cache, layout, modules, &key, vk::PipelineCreateFlags::empty(), dynamic);
+            let made = compile_pipeline(device, cache, layout, modules, &key, vk::PipelineCreateFlags::empty(), dynamic, depth_format);
             log::debug!(
                 target: "zakuro_gpu::pipelines",
                 "compiled a pipeline while drawing went on, in {:.1} ms",
@@ -1217,7 +1223,9 @@ fn work(
     }
 }
 
-/// a draw pipeline for a key, with its vertex and fragment shader modules.
+/// a draw pipeline for a key, with its vertex and fragment shader modules,
+/// drawing depth in the depth format given.
+#[allow(clippy::too_many_arguments)]
 fn compile_pipeline(
     device: &ash::Device,
     cache: vk::PipelineCache,
@@ -1226,6 +1234,7 @@ fn compile_pipeline(
     key: &PipelineKey,
     flags: vk::PipelineCreateFlags,
     dynamic: Dynamic,
+    depth_format: vk::Format,
 ) -> Result<vk::Pipeline, String> {
     let entries: Vec<vk::SpecializationMapEntry> = (0..FRAGMENT_CONSTANTS as u32)
         .map(|id| vk::SpecializationMapEntry::default().constant_id(id).offset(id * 4).size(4))
@@ -1322,7 +1331,7 @@ fn compile_pipeline(
     }
     let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
     let color_formats = [COLOR_FORMAT];
-    let depth_format = if key.depth { DEPTH_FORMAT } else { vk::Format::UNDEFINED };
+    let depth_format = if key.depth { depth_format } else { vk::Format::UNDEFINED };
     let mut rendering = vk::PipelineRenderingCreateInfo::default()
         .color_attachment_formats(&color_formats)
         .depth_attachment_format(depth_format)
@@ -1477,6 +1486,9 @@ pub struct Hardware {
     name: String,
     /// how many times the console's resolution surfaces are drawn at.
     scale: u32,
+    /// what depth buffers are drawn into, DEPTH_FORMAT, or where the GPU
+    /// can't, FLOAT_DEPTH_FORMAT.
+    depth_format: vk::Format,
     /// whether the GPU can blit the color format, which scaling needs.
     blits: bool,
     /// whether it can blit the depth format too. Intel's drivers for
@@ -1590,6 +1602,10 @@ impl Hardware {
                 mapped: std::ptr::null_mut(),
                 incoherent: false,
             };
+            let depth_format = depth_format(&instance, physical).ok_or("the GPU can't draw into a depth and stencil format")?;
+            if depth_format == FLOAT_DEPTH_FORMAT {
+                log::info!("depth buffers are drawn in 32-bit floats standing for the console's 24 bits");
+            }
             let blits_into = |format| {
                 let features = instance.get_physical_device_format_properties(physical, format).optimal_tiling_features;
                 features.contains(vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST)
@@ -1597,7 +1613,7 @@ impl Hardware {
             let blits = blits_into(COLOR_FORMAT);
             // ZAKURO_DEPTH_BLITS=0 scales depth buffers the other way all the
             // same, to tell the two apart
-            let depth_blits = blits_into(DEPTH_FORMAT) && std::env::var("ZAKURO_DEPTH_BLITS").map_or(true, |v| v != "0");
+            let depth_blits = blits_into(depth_format) && std::env::var("ZAKURO_DEPTH_BLITS").map_or(true, |v| v != "0");
             if !depth_blits {
                 log::info!("the GPU can't blit depth buffers, they are scaled on the CPU on their way to and from memory");
             }
@@ -1608,7 +1624,7 @@ impl Hardware {
                 .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(&saved), None)
                 .or_else(|_| device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None))
                 .map_err(vk_error("create a pipeline cache"))?;
-            let compiler = Compiler::start(device.clone(), pipeline_cache, kept_pipelines.clone(), layout, [fragment_shader, depth_fragment_shader], dynamic);
+            let compiler = Compiler::start(device.clone(), pipeline_cache, kept_pipelines.clone(), layout, [fragment_shader, depth_fragment_shader], dynamic, depth_format);
             let blend_state = dynamic.blend.then(|| ash::ext::extended_dynamic_state3::Device::new(&instance, &device));
             let logic_op_state = dynamic.logic_op.then(|| ash::ext::extended_dynamic_state2::Device::new(&instance, &device));
             let mut hardware = Hardware {
@@ -1705,6 +1721,7 @@ impl Hardware {
                 batch: 0,
                 name,
                 scale: 1,
+                depth_format,
                 blits,
                 depth_blits,
                 // the queue has to count time for timestamps to mean anything
@@ -2264,7 +2281,7 @@ impl Hardware {
                     3 => (u32::from_le_bytes([pixel[0], pixel[1], pixel[2], 0]), 0),
                     _ => (u32::from_le_bytes([pixel[0], pixel[1], pixel[2], 0]), pixel[3] as u32),
                 };
-                let value = vk::ClearDepthStencilValue { depth: depth as f32 / 16_777_215.0, stencil };
+                let value = vk::ClearDepthStencilValue { depth: float_depth(depth), stencil };
                 let clear = vk::ClearAttachment::default()
                     .aspect_mask(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL)
                     .clear_value(vk::ClearValue { depth_stencil: value });
@@ -2315,7 +2332,7 @@ impl Hardware {
         {
             Some(index) => index,
             None => {
-                let (format, usage, aspect) = surface_image(kind);
+                let (format, usage, aspect) = surface_image(kind, self.depth_format);
                 let image = self.image(width * self.scale, height * self.scale, format, usage, aspect)?;
                 let native = match self.scale {
                     1 => None,
@@ -2456,7 +2473,7 @@ impl Hardware {
             (s.width * self.scale, s.height * self.scale, s.kind)
         };
         if self.surfaces[index].twin.is_none() {
-            let (format, usage, aspect) = surface_image(kind);
+            let (format, usage, aspect) = surface_image(kind, self.depth_format);
             let image = self.image(width, height, format, usage, aspect)?;
             self.surfaces[index].twin = Some(image);
         }
@@ -2565,6 +2582,7 @@ impl Hardware {
                     (staging.buffer, 0, Some(staging))
                 };
                 let stencils = depths + texels * 4;
+                let floats = self.depth_format == FLOAT_DEPTH_FORMAT;
                 let out = match &staging {
                     Some(staging) => {
                         // SAFETY: the buffer is mapped for its whole size,
@@ -2574,8 +2592,8 @@ impl Hardware {
                     None => self.ring(depths, texels * 5),
                 };
                 let (words, bytes) = out.split_at_mut((texels * 4) as usize);
-                for (word, value) in words.as_chunks_mut::<4>().0.iter_mut().zip(&values) {
-                    *word = value.to_le_bytes();
+                for (word, &value) in words.as_chunks_mut::<4>().0.iter_mut().zip(&values) {
+                    *word = if floats { float_depth(value).to_bits() } else { value }.to_le_bytes();
                 }
                 bytes.copy_from_slice(&stencil);
                 let extent = vk::Extent3D { width: width * n, height: height * n, depth: 1 };
@@ -2876,6 +2894,7 @@ impl Hardware {
             &key,
             vk::PipelineCreateFlags::empty(),
             self.dynamic,
+            self.depth_format,
         )?;
         log::debug!(
             target: "zakuro_gpu::pipelines",
@@ -2893,7 +2912,7 @@ impl Hardware {
         let modules = [self.vertex_module(key.vertex), fragment_module(self.fragment_modules(), &key)];
         let started = std::time::Instant::now();
         let flags = vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED;
-        let pipeline = compile_pipeline(&self.device, self.pipeline_cache, self.layout, modules, &key, flags, self.dynamic).ok()?;
+        let pipeline = compile_pipeline(&self.device, self.pipeline_cache, self.layout, modules, &key, flags, self.dynamic, self.depth_format).ok()?;
         log::debug!(
             target: "zakuro_gpu::pipelines",
             "took pipeline {} from the cache in {:.1} ms",
@@ -3061,7 +3080,7 @@ impl Hardware {
                             3 => (u32::from_le_bytes([pixel[0], pixel[1], pixel[2], 0]), 0),
                             _ => (u32::from_le_bytes([pixel[0], pixel[1], pixel[2], 0]), pixel[3] as u32),
                         };
-                        let value = vk::ClearDepthStencilValue { depth: depth as f32 / 16_777_215.0, stencil };
+                        let value = vk::ClearDepthStencilValue { depth: float_depth(depth), stencil };
                         let range = [vk::ImageSubresourceRange::default()
                             .aspect_mask(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL)
                             .level_count(1)
@@ -3265,7 +3284,7 @@ impl Hardware {
                 None => return,
             },
         };
-        let made = work(job, &self.device, self.pipeline_cache, self.layout, self.fragment_modules(), self.dynamic);
+        let made = work(job, &self.device, self.pipeline_cache, self.layout, self.fragment_modules(), self.dynamic, self.depth_format);
         self.take(made);
     }
 
@@ -4327,7 +4346,8 @@ impl Hardware {
                 .image_info(&target),
         ];
         let (texture_width, texture_height) = (texture.width * n, texture.height * n);
-        let constants = [texture_width as i32, texture_height as i32, width as i32, height as i32, (row * n) as i32, (bytes == 4) as i32];
+        let floats = self.depth_format == FLOAT_DEPTH_FORMAT;
+        let constants = [texture_width as i32, texture_height as i32, width as i32, height as i32, (row * n) as i32, (bytes == 4) as i32, floats as i32];
         let constants: Vec<u8> = constants.iter().flat_map(|c| c.to_le_bytes()).collect();
         // SAFETY: recording, outside rendering, from a depth image in the
         // general layout into a buffer big enough for both aspects, then a
@@ -4737,7 +4757,7 @@ impl Hardware {
     fn depth_pipeline(&mut self) -> Result<(vk::PipelineLayout, vk::Pipeline), String> {
         if self.depth.is_none() {
             let bindings = [vk::DescriptorType::STORAGE_BUFFER, vk::DescriptorType::STORAGE_BUFFER, vk::DescriptorType::STORAGE_IMAGE];
-            self.depth = Some(self.compute(DEPTH_SPIRV, &bindings, 6 * 4)?);
+            self.depth = Some(self.compute(DEPTH_SPIRV, &bindings, 7 * 4)?);
         }
         let depth = self.depth.as_ref().expect("made above");
         Ok((depth.layout, depth.pipeline))
@@ -5169,10 +5189,12 @@ impl Hardware {
             }
             Kind::Depth(sample) => {
                 let (depths, stencils) = data.split_at(pixels * 4);
+                let floats = self.depth_format == FLOAT_DEPTH_FORMAT;
                 for y in first..last {
                     for x in 0..width {
                         let i = ((height - 1 - y) * width + x) as usize;
-                        let d24 = u32::from_le_bytes(depths[i * 4..i * 4 + 4].try_into().unwrap()) & 0xFF_FFFF;
+                        let word = u32::from_le_bytes(depths[i * 4..i * 4 + 4].try_into().unwrap());
+                        let d24 = if floats { d24_from_float(f32::from_bits(word)) } else { word & 0xFF_FFFF };
                         let out = morton_offset(x, y, width, sample) as usize;
                         match sample {
                             2 => {
@@ -5421,23 +5443,53 @@ fn scale_down_depth(data: &[u8], width: u32, height: u32, n: u32) -> Vec<u8> {
     out
 }
 
+/// the float FLOAT_DEPTH_FORMAT holds a 24-bit depth as, the one nearest
+/// what it stands for, which clearing a depth buffer to it gives in either
+/// format. d24_from_float gives the 24 bits back.
+fn float_depth(d24: u32) -> f32 {
+    d24 as f32 / 16_777_215.0
+}
+
+/// the 24-bit depth nearest a float one, a half going up, as depth.comp
+/// works it out too, and as DEPTH_FORMAT would hold what was drawn, give or
+/// take how the GPU rounds halves.
+fn d24_from_float(depth: f32) -> u32 {
+    (depth as f64 * 16_777_215.0 + 0.5).floor().clamp(0.0, 16_777_215.0) as u32
+}
+
 /// whether the renderer can draw on a GPU, Vulkan 1.3, push descriptors,
-/// depth clamping and a D24S8 depth format.
+/// depth clamping and a depth format, see depth_format.
 fn renders_on(instance: &ash::Instance, device: vk::PhysicalDevice) -> bool {
     // SAFETY: queries on a GPU of the instance
-    let (properties, features, depth, extensions) = unsafe {
+    let (properties, features, extensions) = unsafe {
         (
             instance.get_physical_device_properties(device),
             instance.get_physical_device_features(device),
-            instance.get_physical_device_format_properties(device, DEPTH_FORMAT),
             instance.enumerate_device_extension_properties(device).unwrap_or_default(),
         )
     };
     let push = extensions.iter().any(|e| e.extension_name_as_c_str() == Ok(ash::khr::push_descriptor::NAME));
     properties.api_version >= vk::API_VERSION_1_3
         && features.depth_clamp == vk::TRUE
-        && depth.optimal_tiling_features.contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+        && depth_format(instance, device).is_some()
         && push
+}
+
+/// the format a GPU draws depth buffers into, DEPTH_FORMAT, the console's
+/// 24 bits, or where it can't, FLOAT_DEPTH_FORMAT. Vulkan has every GPU do
+/// one of the two, AMD's only the floats. ZAKURO_FLOAT_DEPTH set has the
+/// floats wherever the GPU does them, to tell the two apart.
+fn depth_format(instance: &ash::Instance, device: vk::PhysicalDevice) -> Option<vk::Format> {
+    let draws_into = |format| {
+        // SAFETY: a query on a GPU of the instance
+        let features = unsafe { instance.get_physical_device_format_properties(device, format) }.optimal_tiling_features;
+        features.contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+    };
+    let mut formats = [DEPTH_FORMAT, FLOAT_DEPTH_FORMAT];
+    if std::env::var_os("ZAKURO_FLOAT_DEPTH").is_some() {
+        formats.reverse();
+    }
+    formats.into_iter().find(|&format| draws_into(format))
 }
 
 /// whether the renderer can draw on a GPU through a family of its queues,
@@ -5779,5 +5831,50 @@ mod tests {
         let to = (2 * width + 3) as usize;
         assert_eq!(&down[to * 4..to * 4 + 4], &0xABCDEFu32.to_le_bytes());
         assert_eq!(down[(width * height) as usize * 4 + to], 0x5A);
+    }
+
+    /// every 24-bit depth held as a float comes back the same, and the
+    /// floats go up as the depths do, so depth tests against them pass and
+    /// fail as against the 24 bits.
+    #[test]
+    fn a_depth_held_as_a_float_comes_back_the_same() {
+        let mut last = -1.0;
+        for d24 in 0..=0xFF_FFFF {
+            let float = float_depth(d24);
+            assert!(float > last, "{d24:06X}");
+            assert_eq!(d24_from_float(float), d24, "{d24:06X}");
+            last = float;
+        }
+        assert_eq!(float_depth(0xFF_FFFF), 1.0);
+    }
+
+    /// depth.comp's way of making a float into 24 bits, in floats as the
+    /// GPU works them, gives what d24_from_float does, for every float from
+    /// a half to one, where the two ways part the most, a spread of those
+    /// below, and those past either end.
+    #[test]
+    fn the_depth_shader_rounds_floats_as_the_cpu_does() {
+        // as depth.comp has it
+        let shader = |depth: f32| -> u32 {
+            // !(depth > 0.0)
+            if depth.is_nan() || depth <= 0.0 {
+                return 0;
+            }
+            if depth >= 1.0 {
+                return 0xFF_FFFF;
+            }
+            let scaled = depth * 16_777_216.0;
+            let whole = scaled.floor();
+            if depth >= 0.5 {
+                return whole as u32 - (depth > 0.5) as u32;
+            }
+            whole as u32 + (scaled - whole > 0.5) as u32
+        };
+        let (half, one) = (0.5f32.to_bits(), 1.0f32.to_bits());
+        let past = [-1.0, -0.0, f32::MIN_POSITIVE / 2.0, 1.0 + f32::EPSILON, 2.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+        for bits in (0..half).step_by(13).chain(half..=one).chain(past.map(f32::to_bits)) {
+            let depth = f32::from_bits(bits);
+            assert_eq!(shader(depth), d24_from_float(depth), "{depth:e}");
+        }
     }
 }
