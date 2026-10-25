@@ -146,8 +146,12 @@ fn scan(folder: &Path, data_dir: Option<&Path>) -> (Vec<Game>, Vec<Addon>) {
 /// library's folder.
 pub fn addons_beside(path: &Path) -> Option<(Option<Addon>, Vec<Addon>, Option<Addon>)> {
     let program_id = zakuro_fs::Title::load(path).ok()?.program_id();
+    // a Download Play child has its game's id, but none of its update or DLC
+    if zakuro_fs::TitleKind::of(program_id) != zakuro_fs::TitleKind::Game {
+        return None;
+    }
     let (mut update, mut dlc, mut dlp_child) = (None::<Addon>, Vec::new(), None);
-    for entry in std::fs::read_dir(path.parent()?).ok()?.flatten() {
+    for entry in std::fs::read_dir(folder_of(path)).ok()?.flatten() {
         let Some(Ok(found)) = addon(&entry.path()) else { continue };
         if found.title_id & 0xFFFF_FFFF != program_id & 0xFFFF_FFFF {
             continue;
@@ -165,6 +169,12 @@ pub fn addons_beside(path: &Path) -> Option<(Option<Addon>, Vec<Addon>, Option<A
     }
     dlc.sort_by(|a, b| a.path.cmp(&b.path));
     Some((update, dlc, dlp_child))
+}
+
+/// the folder a file is in, the one Zakuro runs in for a bare file name,
+/// whose parent is empty.
+fn folder_of(path: &Path) -> &Path {
+    path.parent().filter(|folder| !folder.as_os_str().is_empty()).unwrap_or(Path::new("."))
 }
 
 /// the update or DLC in the file at path, none when it holds neither, and
@@ -422,6 +432,18 @@ mod tests {
         assert_eq!(beside_update.map(|addon| addon.version), Some(0x0410));
         assert_eq!(beside_dlc.iter().map(|addon| addon.title_id).collect::<Vec<_>>(), [dlc]);
         assert_eq!(beside_child.map(|addon| addon.title_id), Some(child));
+        // and the child started on its own, which loads as a title, gets
+        // none of its game's
+        assert!(zakuro_fs::Title::load(folder.join("child.cia")).is_ok());
+        assert!(addons_beside(&folder.join("child.cia")).is_none());
         std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    /// a bare file name is in the folder Zakuro runs in.
+    #[test]
+    fn a_bare_file_name_is_in_the_current_folder() {
+        assert_eq!(folder_of(Path::new("game.3ds")), Path::new("."));
+        assert_eq!(folder_of(Path::new("games/game.3ds")), Path::new("games"));
+        assert_eq!(folder_of(Path::new("/games/game.3ds")), Path::new("/games"));
     }
 }
