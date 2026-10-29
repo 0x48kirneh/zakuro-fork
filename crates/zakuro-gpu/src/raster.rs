@@ -1025,6 +1025,15 @@ fn place(registers: &[u32], shaded: &[Vertex], order: Option<&[usize]>, viewport
     // which of the vertices made each vertex of the draw is
     let at = |i: usize| order.map_or(i, |order| order[i]);
     let triangle_indices = assemble(topology, order.map_or(shaded.len(), <[usize]>::len));
+    // on a buffer upside down the window's rows run from its top, and the
+    // triangles that turns over cull as they would the right way up
+    let flip = upside_down(registers).then(|| buffer_size(registers, viewport).1 as f32);
+    let to_window = |vertex: &Vertex| {
+        to_screen(vertex, viewport).map(|screen| match flip {
+            Some(height) => Screen { y: height - screen.y, ..screen },
+            None => screen,
+        })
+    };
 
     let triangles = triangle_indices.len();
     let mut clipped_away = 0u32;
@@ -1033,7 +1042,7 @@ fn place(registers: &[u32], shaded: &[Vertex], order: Option<&[usize]>, viewport
     let mut placed: Vec<Screen> = Vec::with_capacity(shaded.len());
     let slots: Vec<u32> = shaded
         .iter()
-        .map(|vertex| match inside(vertex).then(|| to_screen(vertex, viewport)).flatten() {
+        .map(|vertex| match inside(vertex).then(|| to_window(vertex)).flatten() {
             Some(screen) => {
                 placed.push(screen);
                 placed.len() as u32 - 1
@@ -1044,7 +1053,7 @@ fn place(registers: &[u32], shaded: &[Vertex], order: Option<&[usize]>, viewport
     let mut indices: Vec<u32> = Vec::with_capacity(triangles * 3);
     let culls = |p: &Screen, q: &Screen, r: &Screen| {
         let counter_clockwise = (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x) > 0.0;
-        cull_mode != 0 && counter_clockwise == (cull_mode == 1)
+        cull_mode != 0 && (counter_clockwise != flip.is_some()) == (cull_mode == 1)
     };
     for (ia, ib, ic) in triangle_indices {
         let (a, b, c) = (at(ia), at(ib), at(ic));
@@ -1058,7 +1067,7 @@ fn place(registers: &[u32], shaded: &[Vertex], order: Option<&[usize]>, viewport
             continue;
         }
         let polygon = clip_triangle([shaded[a], shaded[b], shaded[c]]);
-        let screen: Vec<Screen> = polygon.iter().filter_map(|v| to_screen(v, viewport)).collect();
+        let screen: Vec<Screen> = polygon.iter().filter_map(to_window).collect();
         if screen.len() < 3 || screen.len() != polygon.len() {
             clipped_away += 1;
             continue;
@@ -1074,6 +1083,24 @@ fn place(registers: &[u32], shaded: &[Vertex], order: Option<&[usize]>, viewport
         }
     }
     Placement { placed, indices, triangles, clipped_away, culled }
+}
+
+/// whether the framebuffer is upside down, the window's rows running from
+/// the top of the buffer down: bit 24 of GPUREG_FRAMEBUFFER_DIMENSIONS
+/// clear. titles set it, Star Fox 64 3D clears it for some passes.
+pub(super) fn upside_down(registers: &[u32]) -> bool {
+    registers[REG_FRAMEBUFFER_DIMENSIONS] & (1 << 24) == 0
+}
+
+/// the buffer's real width and height, which the tile addressing uses. it
+/// is often padded past the viewport, and tiling at the viewport's width
+/// instead reads back as the image repeating down the screen. a viewport
+/// reaching past it makes it that much larger.
+fn buffer_size(registers: &[u32], (x, y, width, height): (f32, f32, f32, f32)) -> (u32, u32) {
+    let dimensions = registers[REG_FRAMEBUFFER_DIMENSIONS];
+    let right = (x + width).round() as i32;
+    let top = (y + height).round() as i32;
+    ((dimensions & 0x7FF).max(right.max(1) as u32), (((dimensions >> 12) & 0x3FF) + 1).max(top.max(1) as u32))
 }
 
 /// where the GPU's vertex shader finds each varying, per semantic
@@ -2910,15 +2937,17 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     // the format sits in bits 16-18 of the register, not the low bits, the low
     // half holds how many bytes a pixel takes.
     let target_format = ColorFormat::from_color_buffer((registers[REG_COLOR_BUFFER_FORMAT] >> 16) & 7);
-    // the buffer's real size, which the tile addressing uses, it is often
-    // padded past the viewport, and tiling at the viewport's width instead
-    // reads back as the image repeating down the screen.
-    let dimensions = registers[REG_FRAMEBUFFER_DIMENSIONS];
     let viewport_right = (viewport_x + viewport_width).round() as i32;
     let viewport_top = (viewport_y + viewport_height).round() as i32;
-    let buffer_width = (dimensions & 0x7FF).max(viewport_right.max(1) as u32);
-    let buffer_height = (((dimensions >> 12) & 0x3FF) + 1).max(viewport_top.max(1) as u32);
+    let (buffer_width, buffer_height) = buffer_size(registers, viewport);
     let (target_width, target_height) = (buffer_width, buffer_height);
+    // drawing stays inside the viewport, its rows turned over on a buffer
+    // upside down
+    let (bottom, top) = ((viewport_y.round() as i32).max(0), viewport_top.min(buffer_height as i32));
+    let (bottom, top) = match upside_down(registers) {
+        true => (buffer_height as i32 - top, buffer_height as i32 - bottom),
+        false => (bottom, top),
+    };
 
     // draws are far more frequent than fills or transfers (thousands per
     // second versus dozens), so this stays at trace level to keep debug
@@ -2970,11 +2999,10 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     let state = DrawState {
         target: ColorTarget {
             addr: target_addr,
-            // drawing stays inside the viewport.
             left: (viewport_x.round() as i32).max(0),
-            bottom: (viewport_y.round() as i32).max(0),
+            bottom,
             right: viewport_right.min(buffer_width as i32),
-            top: viewport_top.min(buffer_height as i32),
+            top,
             buffer_width,
             buffer_height,
             format: target_format,
@@ -3404,7 +3432,7 @@ mod tests {
         registers[REG_COLOR_BUFFER_ADDRESS] = COLOR >> 3;
         registers[REG_DEPTH_BUFFER_ADDRESS] = DEPTH >> 3;
         registers[REG_DEPTH_BUFFER_FORMAT] = 3;
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = 8 | (7 << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = 8 | (7 << 12) | 1 << 24;
         registers[REG_COLOR_BUFFER_WRITE] = 0xF;
         registers[REG_DEPTH_STENCIL_WRITE] = 0x3;
         registers[REG_DEPTH_COLOR_MASK] = 0xF << 8;
@@ -3463,6 +3491,39 @@ mod tests {
         }
         let written = rasterize_shaded(&registers, &mut memory, &mut Resources::default(), &cover(-0.5, RED));
         assert_eq!(written, 32);
+    }
+
+    /// a buffer upside down, bit 24 of its dimensions clear, gets in its
+    /// first rows what the same draw puts in its last ones, and the same
+    /// triangles cull.
+    #[test]
+    fn a_buffer_upside_down_has_the_drawing_turned_over() {
+        let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] };
+        // the lower left of the window, wound counter-clockwise
+        let triangle = [vertex(-1.0, -1.0), vertex(0.5, -1.0), vertex(-1.0, 0.25)];
+        // which pixels it covers, row after row of memory
+        let drawn = |flag: u32, cull: u32| {
+            let mut registers = target_registers();
+            registers[REG_FRAMEBUFFER_DIMENSIONS] = 8 | (7 << 12) | flag;
+            registers[REG_FACE_CULLING] = cull;
+            let mut memory = ConsoleMemory::default();
+            rasterize_shaded(&registers, &mut memory, &mut Resources::default(), &triangle);
+            let pixels = pixels(&mut memory);
+            let rows: Vec<Vec<bool>> =
+                (0..8).map(|row| (0..8).map(|x| pixels[(crate::format::morton_offset(x, row, 8, 4) / 4) as usize] != [0; 4]).collect()).collect();
+            rows
+        };
+        let upright = drawn(1 << 24, 0);
+        assert!(upright.iter().flatten().filter(|&&on| on).count() > 8, "too little drawn to tell");
+        assert!(upright[7].iter().any(|&on| on) && !upright[0].iter().any(|&on| on), "drawn at the bottom of the window");
+        let turned: Vec<Vec<bool>> = upright.iter().rev().cloned().collect();
+        assert_eq!(drawn(0, 0), turned);
+        // keeping the counter-clockwise ones keeps it either way up, keeping
+        // the clockwise ones drops it
+        assert_eq!(drawn(1 << 24, 2), upright);
+        assert_eq!(drawn(0, 2), turned);
+        assert!(drawn(1 << 24, 1).iter().flatten().all(|&on| !on));
+        assert!(drawn(0, 1).iter().flatten().all(|&on| !on));
     }
 
     /// a floor-like triangle with its far corner behind the camera, the part in
@@ -3524,7 +3585,7 @@ mod tests {
         registers[REG_VIEWPORT_HEIGHT] = float24(128.0);
         registers[REG_COLOR_BUFFER_ADDRESS] = BIG_COLOR >> 3;
         registers[REG_DEPTH_BUFFER_ADDRESS] = BIG_DEPTH >> 3;
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = 256 | (255 << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = 256 | (255 << 12) | 1 << 24;
         let mut memory = ConsoleMemory::default();
         let vertex = |x: f32, y: f32| Vertex { clip: [x, y, -0.5, 1.0], color: RED, texcoords: [[0.0; 2]; 3], quaternion: [0.0, 0.0, 0.0, 1.0], view: [0.0; 3] };
         let quad = [
@@ -3696,7 +3757,7 @@ mod tests {
         let mut registers = target_registers();
         registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
 
         let mut seed = 1u32;
         let mut random = move |range: u32| {
@@ -4044,7 +4105,7 @@ mod tests {
     fn sized(registers: &mut [u32], width: u32, height: u32) {
         registers[REG_VIEWPORT_WIDTH] = float24(width as f32 / 2.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(height as f32 / 2.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = width | ((height - 1) << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = width | ((height - 1) << 12) | 1 << 24;
     }
 
     /// a fill over every row the GPU drew leaves the buffer as memory holds
@@ -4230,7 +4291,7 @@ mod tests {
         let mut registers = target_registers();
         // eight by sixteen, two rows of tiles
         registers[REG_VIEWPORT_HEIGHT] = float24(8.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = 8 | (15 << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = 8 | (15 << 12) | 1 << 24;
         let mut memory = ConsoleMemory::default();
         let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
         rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
@@ -4289,12 +4350,12 @@ mod tests {
         let mut drawing = target_registers();
         drawing[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         drawing[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 4.0);
-        drawing[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE / 2 - 1) << 12);
+        drawing[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE / 2 - 1) << 12) | 1 << 24;
         let mut sampling = target_registers();
         sampling[REG_COLOR_BUFFER_ADDRESS] = TARGET >> 3;
         sampling[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         sampling[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-        sampling[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        sampling[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
         sampling[REG_TEXTURE_CONFIG] = 1;
         sampling[REG_TEXTURE0_DIMENSIONS] = SIZE | (SIZE << 16);
         sampling[REG_TEXTURE0_ADDRESS] = COLOR >> 3;
@@ -4373,7 +4434,7 @@ mod tests {
         let mut registers = target_registers();
         // eight by sixteen, two rows of tiles
         registers[REG_VIEWPORT_HEIGHT] = float24(8.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = 8 | (15 << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = 8 | (15 << 12) | 1 << 24;
         let mut memory = ConsoleMemory::default();
         let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
         rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
@@ -4629,7 +4690,7 @@ mod tests {
         registers[REG_VIEWPORT_XY] = 4 | 6 << 16;
         registers[REG_VIEWPORT_WIDTH] = float24(12.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(12.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
         registers[REG_DEPTH_COLOR_MASK] = 0xF << 8 | 1 | 4 << 4 | 1 << 12;
         registers[REG_VIEWPORT_DEPTH_RANGE] = float24(-1.0);
         registers[REG_DEPTHMAP_ENABLE] = 1;
@@ -4793,7 +4854,7 @@ mod tests {
         let mut registers = target_registers();
         registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
         registers[REG_SHADER_OUTPUT_TOTAL] = 2;
         registers[REG_SHADER_OUTPUT_MAP] = 0x0302_0100;
         registers[REG_SHADER_OUTPUT_MAP + 1] = 0x0B0A_0908;
@@ -4901,32 +4962,40 @@ mod tests {
                 _ => indices.iter().map(|&index| index as u8).collect(),
             };
 
-            let mut decoded = ConsoleMemory::default();
-            let mut raw = ArrayMemory::new();
-            decoded.write(0x1400_0000, &bytes);
-            decoded.write(0x1400_0000 + INDICES, &index_bytes);
-            raw.write(0x1400_0000, &bytes);
-            raw.write(0x1400_0000 + INDICES, &index_bytes);
-            decoded.write(COLOR, &vec![0u8; (SIZE * SIZE * 4) as usize]);
-            raw.write(COLOR, &vec![0u8; (SIZE * SIZE * 4) as usize]);
-            let indexed = case.indices.is_some();
-            draw(&registers, &unit, &unit, &fixed, &mut decoded, &mut resources, indexed, None);
-            resources.hardware.as_mut().unwrap().flush(&mut decoded).unwrap();
-            draw(&registers, &unit, &unit, &fixed, &mut raw, &mut resources, indexed, None);
-            resources.hardware.as_mut().unwrap().flush(&mut raw).unwrap();
-            // the first array whole, from the first vertex used to the last
-            let span = match indexed {
-                true => indices.iter().max().unwrap() - indices.iter().min().unwrap() + 1,
-                false => VERTICES,
-            };
-            let whole = ((span - 1) * case.loaders[0].1 + sizes[0]) as usize;
-            assert!(raw.sliced.contains(&whole), "case {number}, the arrays went to the GPU as they are");
-            let (mut a, mut b) = (vec![0u8; (SIZE * SIZE * 4) as usize], vec![0u8; (SIZE * SIZE * 4) as usize]);
-            decoded.read(COLOR, &mut a);
-            raw.read(COLOR, &mut b);
-            let drawn = a.chunks(4).filter(|pixel| *pixel != [0; 4]).count();
-            assert!(drawn > 50, "case {number}, only {drawn} pixels drawn");
-            assert!(a == b, "case {number}, the arrays decode differently");
+            // the buffer the right way up and upside down, and culling
+            // either way round, which the GPU turns over with the window
+            for (flip, cull) in [(1 << 24, 0), (0, 0), (0, 1), (0, 2), (1 << 24, 1)] {
+                registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | flip;
+                registers[REG_FACE_CULLING] = cull;
+                let mut decoded = ConsoleMemory::default();
+                let mut raw = ArrayMemory::new();
+                decoded.write(0x1400_0000, &bytes);
+                decoded.write(0x1400_0000 + INDICES, &index_bytes);
+                raw.write(0x1400_0000, &bytes);
+                raw.write(0x1400_0000 + INDICES, &index_bytes);
+                decoded.write(COLOR, &vec![0u8; (SIZE * SIZE * 4) as usize]);
+                raw.write(COLOR, &vec![0u8; (SIZE * SIZE * 4) as usize]);
+                let indexed = case.indices.is_some();
+                draw(&registers, &unit, &unit, &fixed, &mut decoded, &mut resources, indexed, None);
+                resources.hardware.as_mut().unwrap().flush(&mut decoded).unwrap();
+                draw(&registers, &unit, &unit, &fixed, &mut raw, &mut resources, indexed, None);
+                resources.hardware.as_mut().unwrap().flush(&mut raw).unwrap();
+                // the first array whole, from the first vertex used to the last
+                let span = match indexed {
+                    true => indices.iter().max().unwrap() - indices.iter().min().unwrap() + 1,
+                    false => VERTICES,
+                };
+                let whole = ((span - 1) * case.loaders[0].1 + sizes[0]) as usize;
+                assert!(raw.sliced.contains(&whole), "case {number}, the arrays went to the GPU as they are");
+                let (mut a, mut b) = (vec![0u8; (SIZE * SIZE * 4) as usize], vec![0u8; (SIZE * SIZE * 4) as usize]);
+                decoded.read(COLOR, &mut a);
+                raw.read(COLOR, &mut b);
+                let drawn = a.chunks(4).filter(|pixel| *pixel != [0; 4]).count();
+                if cull == 0 {
+                    assert!(drawn > 50, "case {number}, only {drawn} pixels drawn");
+                }
+                assert!(a == b, "case {number}, flip {flip:X}, cull {cull}: the arrays decode differently");
+            }
         }
     }
 
@@ -4985,7 +5054,7 @@ mod tests {
         let mut registers = target_registers();
         registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
         registers[REG_SHADER_OUTPUT_TOTAL] = 2;
         registers[REG_SHADER_OUTPUT_MAP] = 0x0302_0100;
         registers[REG_SHADER_OUTPUT_MAP + 1] = 0x0B0A_0908;
@@ -5108,7 +5177,7 @@ mod tests {
         registers[REG_VIEWPORT_XY] = 4 | 6 << 16;
         registers[REG_VIEWPORT_WIDTH] = float24(12.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(12.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = TRANSLATION_SIZE | ((TRANSLATION_SIZE - 1) << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = TRANSLATION_SIZE | ((TRANSLATION_SIZE - 1) << 12) | 1 << 24;
         registers[REG_DEPTH_COLOR_MASK] = 0xF << 8 | 1 | 4 << 4 | 1 << 12;
         registers[REG_VIEWPORT_DEPTH_RANGE] = float24(-1.0);
         registers[REG_DEPTHMAP_ENABLE] = 1;
@@ -5594,7 +5663,7 @@ mod tests {
         let mut drawing = target_registers();
         drawing[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         drawing[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-        drawing[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        drawing[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
         if depth {
             // depth written always, the stencil as it comes, the depth
             // being -z as titles map it
@@ -5609,7 +5678,7 @@ mod tests {
         sampling[REG_COLOR_BUFFER_ADDRESS] = TARGET >> 3;
         sampling[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         sampling[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 4.0);
-        sampling[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE / 2 - 1) << 12);
+        sampling[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE / 2 - 1) << 12) | 1 << 24;
         sampling[REG_TEXTURE_CONFIG] = 1;
         sampling[REG_TEXTURE0_DIMENSIONS] = (SIZE / 2) | (SIZE << 16);
         let source = if depth { DEPTH } else { COLOR };
@@ -5693,7 +5762,7 @@ mod tests {
             let mut registers = target_registers();
             registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
             registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-            registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+            registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
             registers[REG_COLOR_BUFFER_FORMAT] = input_format.color_buffer_raw() << 16;
             // triangles in all sorts of colors over each other
             let mut drawn = ConsoleMemory::default();
@@ -5850,7 +5919,7 @@ mod tests {
         let mut registers = target_registers();
         registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
         let mut drawn = ConsoleMemory::default();
         for _ in 0..40 {
             let color = [random(), random(), random(), random()];
@@ -5965,7 +6034,7 @@ mod tests {
         let mut registers = target_registers();
         registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
         let mut gpu = ConsoleMemory::default();
         let triangle: Vec<Vertex> = [[-1.0, -1.0], [3.0, -1.0], [-1.0, 3.0]]
             .into_iter()
@@ -6040,7 +6109,7 @@ mod tests {
                 let mut registers = target_registers();
                 registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
                 registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-                registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+                registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
                 let mut seed = 11u32;
                 let mut random = move || {
                     seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -6124,7 +6193,7 @@ mod tests {
         let mut registers = target_registers();
         registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
-        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12);
+        registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
         let transfer = hardware::Transfer {
             input: COLOR,
             output: OUTPUT,
