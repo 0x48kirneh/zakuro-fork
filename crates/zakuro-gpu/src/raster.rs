@@ -1554,6 +1554,9 @@ struct Decoded {
     /// made by then.
     checked: (u64, usize),
     replacement: Option<Arc<crate::pack::Material>>,
+    /// what memory gave when the bytes were last read, which tells while
+    /// nothing wrote them since, see GpuMemory::watch.
+    watch: Option<u64>,
 }
 
 /// how many texels the cache holds before it starts over, 256 MiB of them.
@@ -1599,6 +1602,25 @@ impl TextureCache {
         (list == self.list && !overwritten).then(|| (decoded.texels.clone(), decoded.replacement.clone()))
     }
 
+    /// the texture, when memory has had nothing written over it since its
+    /// bytes were last read, which then counts as checked in this list too.
+    fn unchanged<M: GpuMemory>(&mut self, key: TextureKey, size: u32, memory: &mut M) -> Option<Found> {
+        let decoded = self.entries.get_mut(&key)?;
+        let watch = decoded.watch?;
+        if !memory.unchanged(key.0, size, watch) {
+            return None;
+        }
+        decoded.checked = (self.list, self.written.len());
+        Some((decoded.texels.clone(), decoded.replacement.clone()))
+    }
+
+    /// has memory watch the bytes the texture was just read from.
+    fn watch<M: GpuMemory>(&mut self, key: TextureKey, size: u32, memory: &mut M) {
+        if let Some(decoded) = self.entries.get_mut(&key) {
+            decoded.watch = memory.watch(key.0, size);
+        }
+    }
+
     fn decoded(&mut self, key: TextureKey, data: &[u8]) -> Found {
         let (_, format, width, height) = key;
         let hash = fingerprint(data);
@@ -1640,7 +1662,7 @@ impl TextureCache {
             .map(|(x, y)| crate::texture::sample_texel(data, format, width, x, y))
             .collect();
         let replacement = picture_for(self.pack.as_deref(), data, &texels, key, &mut self.rows);
-        let decoded = Decoded { hash, bytes: data.to_vec(), texels: texels.clone(), checked, replacement: replacement.clone() };
+        let decoded = Decoded { hash, bytes: data.to_vec(), texels: texels.clone(), checked, replacement: replacement.clone(), watch: None };
         if let Some(old) = self.entries.insert(key, decoded) {
             self.texels -= old.texels.len();
         }
@@ -1828,12 +1850,19 @@ fn bind_texture<M: GpuMemory>(
     let (texels, replacement) = match (drawn, cache.checked(key, size as u32)) {
         (Some(_), _) if !past => (Arc::default(), None),
         (_, Some(found)) => found,
-        (_, None) => match memory.slice(addr, size) {
-            Some(data) => cache.decoded(key, data),
+        (_, None) => match cache.unchanged(key, size as u32, memory) {
+            Some(found) => found,
             None => {
-                let mut data = vec![0u8; size];
-                memory.read(addr, &mut data);
-                cache.decoded(key, &data)
+                let found = match memory.slice(addr, size) {
+                    Some(data) => cache.decoded(key, data),
+                    None => {
+                        let mut data = vec![0u8; size];
+                        memory.read(addr, &mut data);
+                        cache.decoded(key, &data)
+                    }
+                };
+                cache.watch(key, size as u32, memory);
+                found
             }
         },
     };
