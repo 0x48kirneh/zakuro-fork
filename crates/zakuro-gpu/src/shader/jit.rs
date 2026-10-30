@@ -46,6 +46,20 @@ const DEEPEST: usize = 16;
 /// how many programs' code is kept, past which it starts over.
 const KEPT: usize = 1024;
 
+/// how hard a program is compiled: quickly the first time, with the register
+/// allocator that takes a third of the time for code a fifth slower, so that
+/// it runs compiled soon after it is first drawn with, and again in full
+/// once it has shaded HOT batches, the quick code shading meanwhile.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Tier {
+    Quick,
+    Full,
+}
+
+/// how many batches a program compiled quickly shades before it is compiled
+/// again in full.
+const HOT: u32 = 4096;
+
 /// what a compiled program reads and writes, the registers as rows of lanes.
 #[repr(C, align(16))]
 pub(super) struct Context {
@@ -206,6 +220,9 @@ extern "C" fn emit(context: *mut Context) {
 pub(super) struct Compiled {
     module: Option<JITModule>,
     function: unsafe extern "C" fn(*mut Context) -> u32,
+    tier: Tier,
+    /// whether it is being compiled again in full.
+    upgrading: AtomicBool,
     /// the batches it ran and gave back, it gives up on a program whose
     /// vertices part ways often, which batch shades better.
     runs: AtomicU32,
@@ -299,7 +316,14 @@ pub(super) fn compiled(unit: &ShaderUnit, program: &Arc<Program>) -> Option<Arc<
     let key = (program.fingerprint, unit.entry_point);
     let mut kept = codes();
     match kept.get(&key) {
-        Some(Slot::Done(found)) => return found.clone().filter(|compiled| !compiled.given_up.load(Ordering::Relaxed)),
+        Some(Slot::Done(found)) => {
+            let found = found.clone().filter(|compiled| !compiled.given_up.load(Ordering::Relaxed))?;
+            if found.tier == Tier::Quick && found.runs.load(Ordering::Relaxed) >= HOT && !found.upgrading.swap(true, Ordering::Relaxed) {
+                drop(kept);
+                upgrade(program.clone(), key, found.clone());
+            }
+            return Some(found);
+        }
         Some(Slot::Compiling) => return None,
         None => {}
     }
@@ -308,7 +332,7 @@ pub(super) fn compiled(unit: &ShaderUnit, program: &Arc<Program>) -> Option<Arc<
     }
     // the tests look at what the compiled code gives from the first run
     if cfg!(test) {
-        let found = compile_logged(program, key.1);
+        let found = compile_logged(program, key.1, Tier::Full);
         kept.insert(key, Slot::Done(found.clone()));
         return found;
     }
@@ -316,7 +340,7 @@ pub(super) fn compiled(unit: &ShaderUnit, program: &Arc<Program>) -> Option<Arc<
     drop(kept);
     let program = program.clone();
     let spawned = std::thread::Builder::new().name("shader jit".to_owned()).spawn(move || {
-        let found = compile_logged(&program, key.1);
+        let found = compile_logged(&program, key.1, Tier::Quick);
         codes().insert(key, Slot::Done(found));
     });
     if let Err(error) = spawned {
@@ -326,10 +350,26 @@ pub(super) fn compiled(unit: &ShaderUnit, program: &Arc<Program>) -> Option<Arc<
     None
 }
 
+/// compiles a program in full on a thread of its own, its quick code
+/// shading meanwhile, and puts it in the quick code's place, unless that
+/// has gone since.
+fn upgrade(program: Arc<Program>, key: (u64, u32), quick: Arc<Compiled>) {
+    let spawned = std::thread::Builder::new().name("shader jit".to_owned()).spawn(move || {
+        let Some(full) = compile_logged(&program, key.1, Tier::Full) else { return };
+        let mut kept = codes();
+        if matches!(kept.get(&key), Some(Slot::Done(Some(current))) if Arc::ptr_eq(current, &quick)) {
+            kept.insert(key, Slot::Done(Some(full)));
+        }
+    });
+    if let Err(error) = spawned {
+        log::warn!("could not start compiling a shader in full, {error}");
+    }
+}
+
 /// compiles the program for an entry point, saying why not when it can't.
-fn compile_logged(program: &Program, entry: u32) -> Option<Arc<Compiled>> {
+fn compile_logged(program: &Program, entry: u32, tier: Tier) -> Option<Arc<Compiled>> {
     let start = std::time::Instant::now();
-    let found = match compile(program, entry) {
+    let found = match compile(program, entry, tier) {
         Ok(compiled) => Some(Arc::new(compiled)),
         Err(error) => {
             log::debug!(target: "zakuro_gpu::shader::jit", "the program {:016X} at {entry} is not compiled, {error}", program.fingerprint);
@@ -338,7 +378,7 @@ fn compile_logged(program: &Program, entry: u32) -> Option<Arc<Compiled>> {
     };
     log::trace!(
         target: "zakuro_gpu::shader::jit",
-        "the program {:016X} at {entry} took {:?}, {} instructions",
+        "the program {:016X} at {entry} took {:?} {tier:?}, {} instructions",
         program.fingerprint,
         start.elapsed(),
         program.ops.iter().filter(|op| op.opcode != OpCode::Nop && op.instruction.0 != 0).count()
@@ -643,12 +683,23 @@ struct Helpers {
 
 /// compiles the program for an entry point, why not when the host has no
 /// backend or the program goes too many ways.
-pub(super) fn compile(program: &Program, entry: u32) -> Result<Compiled, String> {
+pub(super) fn compile(program: &Program, entry: u32, tier: Tier) -> Result<Compiled, String> {
     let mut flags = settings::builder();
     // the verifier looks the code over for Cranelift's own sake, a quarter
     // of the time compiling took, the tests have it
     let verify = if cfg!(debug_assertions) { "true" } else { "false" };
-    for (name, value) in [("opt_level", "speed"), ("use_colocated_libcalls", "false"), ("is_pic", "false"), ("enable_verifier", verify)] {
+    let allocator = match tier {
+        Tier::Quick => "single_pass",
+        Tier::Full => "backtracking",
+    };
+    let flagged = [
+        ("opt_level", "speed"),
+        ("use_colocated_libcalls", "false"),
+        ("is_pic", "false"),
+        ("enable_verifier", verify),
+        ("regalloc_algorithm", allocator),
+    ];
+    for (name, value) in flagged {
         flags.set(name, value).map_err(|error| format!("{name}, {error}"))?;
     }
     let isa = cranelift_native::builder()?.finish(settings::Flags::new(flags)).map_err(|error| error.to_string())?;
@@ -714,6 +765,8 @@ pub(super) fn compile(program: &Program, entry: u32) -> Result<Compiled, String>
     Ok(Compiled {
         module: Some(module),
         function,
+        tier,
+        upgrading: AtomicBool::new(false),
         runs: AtomicU32::new(0),
         returned: AtomicU32::new(0),
         parted: AtomicU32::new(0),
