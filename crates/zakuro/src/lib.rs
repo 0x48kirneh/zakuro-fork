@@ -644,8 +644,10 @@ impl App {
 
     /// starts the game at path, in place of any other.
     fn play(&mut self, path: &Path) -> Result<(), String> {
-        // the old game and what it holds on the GPU go first, its sound too
+        // the old game and what it holds on the GPU go first, its sound too,
+        // and the overlay's line about it
         self.game = None;
+        self.overlay_corner = None;
         if let Some(audio) = &self.audio {
             audio.clear();
         }
@@ -1312,7 +1314,10 @@ impl App {
         }
         game.system.set_input(input);
         let outcome = game.system.run_frame();
-        if let Some(overlay) = &mut self.overlay {
+        // the overlay reads the game the program was built on, not another
+        // one its library opened
+        let ours = self.linked.as_ref().is_none_or(|linked| game.system.title.as_ref().is_some_and(|title| title.program_id() == linked.program_id()));
+        if let Some(overlay) = self.overlay.as_mut().filter(|_| ours) {
             let text = overlay.frame(&mut game.system.memory);
             self.overlay_corner = text.corner;
             if let Some(notice) = text.notice {
@@ -1505,6 +1510,9 @@ impl App {
                 log::info!("loaded the state from {}", path.display());
                 self.menus.toast = Some((format!("Loaded slot {slot}"), Instant::now()));
                 self.menus.menu_open = false;
+                // the overlay's line was about the memory before, the next
+                // frame gives the one about the state
+                self.overlay_corner = None;
                 if let Some(audio) = &self.audio {
                     audio.clear();
                 }
